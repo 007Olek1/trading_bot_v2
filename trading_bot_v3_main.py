@@ -68,6 +68,22 @@ class TradingBotV2:
             'no_signals': 0
         }
         
+        # ЗАЩИТА ОТ ДУБЛИРОВАНИЯ СДЕЛОК
+        # Формат: {symbol: {'last_trade_time': datetime, 'last_side': str}}
+        self.symbol_trade_history = {}
+        self.cooldown_hours = 6  # 6 часов между сделками по одной монете
+        
+        # Статистика предотвращения дублирования
+        self.duplicate_prevention_stats = {
+            'prevented_by_position_check': 0,
+            'prevented_by_cooldown': 0,
+            'prevented_by_exchange_check': 0,
+            'total_prevented': 0
+        }
+        
+        # Загружаем историю торговли из файла
+        self._load_trade_history()
+        
         # Telegram
         self.telegram_app = None
         
@@ -194,6 +210,9 @@ class TradingBotV2:
             logger.info("✅ Бот запущен успешно!")
             logger.info("=" * 60)
             
+            # Очищаем устаревшие записи cooldown при старте
+            self._cleanup_expired_cooldowns()
+            
             # Держим бота работающим
             while self.running:
                 await asyncio.sleep(1)
@@ -302,6 +321,12 @@ class TradingBotV2:
                 if any(p['symbol'] == symbol for p in self.open_positions):
                     continue
                 
+                # КРИТИЧНО: Проверка cooldown - предотвращаем повторные входы
+                if self._is_symbol_on_cooldown(symbol):
+                    hours_remaining = self._get_cooldown_remaining_hours(symbol)
+                    logger.debug(f"⏰ {symbol} на cooldown (осталось {hours_remaining:.1f}ч)")
+                    continue
+                
                 # Получаем ПОЛНЫЙ анализ (включая сигналы 85%+)
                 signal_result = await self.analyze_symbol_full(symbol)
                 
@@ -381,6 +406,10 @@ class TradingBotV2:
                     if position:
                         logger.info(f"✅ Позиция открыта: {symbol}")
                         super_ai_agent.decisions_made += 1
+                        
+                        # КРИТИЧНО: Добавляем в cooldown
+                        self._add_symbol_to_cooldown(symbol, best_signal['signal'])
+                        
                         # Пауза 30 секунд
                         logger.info("⏸️ Пауза 30 сек перед следующим анализом...")
                         await asyncio.sleep(30)
@@ -534,7 +563,30 @@ class TradingBotV2:
         try:
             logger.info(f"🚀 Открытие позиции: {symbol} {side.upper()}")
             
-            # 0. ПРОВЕРКА AI АГЕНТА
+            # 0. ДВОЙНАЯ ПРОВЕРКА НА ДУБЛИРОВАНИЕ (последняя линия защиты)
+            if any(p['symbol'] == symbol for p in self.open_positions):
+                logger.warning(f"⚠️ ДУБЛИРОВАНИЕ ПРЕДОТВРАЩЕНО: {symbol} уже есть в позициях!")
+                self.duplicate_prevention_stats['prevented_by_position_check'] += 1
+                self.duplicate_prevention_stats['total_prevented'] += 1
+                return None
+            
+            if self._is_symbol_on_cooldown(symbol):
+                hours_remaining = self._get_cooldown_remaining_hours(symbol)
+                logger.warning(f"⚠️ ДУБЛИРОВАНИЕ ПРЕДОТВРАЩЕНО: {symbol} на cooldown ({hours_remaining:.1f}ч)!")
+                self.duplicate_prevention_stats['prevented_by_cooldown'] += 1
+                self.duplicate_prevention_stats['total_prevented'] += 1
+                return None
+            
+            # Проверяем реальные позиции на бирже (может быть рассинхронизация)
+            real_positions = await exchange_manager.fetch_positions()
+            for pos in real_positions:
+                if pos['symbol'] == symbol and float(pos.get('contracts', 0)) > 0:
+                    logger.warning(f"⚠️ ДУБЛИРОВАНИЕ ПРЕДОТВРАЩЕНО: {symbol} уже есть на бирже!")
+                    self.duplicate_prevention_stats['prevented_by_exchange_check'] += 1
+                    self.duplicate_prevention_stats['total_prevented'] += 1
+                    return None
+            
+            # 1. ПРОВЕРКА AI АГЕНТА
             balance = await exchange_manager.get_balance()
             agent_allow, agent_reason = trading_bot_agent.should_allow_new_trade(
                 signal_confidence=signal_data.get('confidence', 0) / 100,
@@ -709,9 +761,9 @@ class TradingBotV2:
                 tp_amount = amount * tp_percentages[i]
                 
                 # Создаем ордер
-            tp_order = await exchange_manager.create_limit_order(
-                symbol=symbol,
-                side=close_side,
+                tp_order = await exchange_manager.create_limit_order(
+                    symbol=symbol,
+                    side=close_side,
                     amount=tp_amount,
                     price=tp_price
                 )
@@ -780,6 +832,9 @@ class TradingBotV2:
         try:
             exchange_positions = await exchange_manager.fetch_positions()
             
+            # КРИТИЧНО: Сохраняем символы текущих позиций перед очисткой
+            current_position_symbols = {p['symbol'] for p in self.open_positions}
+            
             # Обновляем наш список
             self.open_positions = []
             
@@ -813,6 +868,18 @@ class TradingBotV2:
                     }
                     
                     self.open_positions.append(position)
+            
+            # КРИТИЧНО: Добавляем в cooldown символы, которые больше не имеют позиций
+            # (значит они были закрыты и нужно предотвратить повторный вход)
+            new_position_symbols = {p['symbol'] for p in self.open_positions}
+            closed_symbols = current_position_symbols - new_position_symbols
+            
+            for symbol in closed_symbols:
+                if symbol not in self.symbol_trade_history:
+                    # Если позиция закрылась, но мы не знаем когда она была открыта,
+                    # добавляем в cooldown сейчас для безопасности
+                    self._add_symbol_to_cooldown(symbol, "unknown")
+                    logger.info(f"🛡️ {symbol} добавлен в cooldown (позиция закрыта)")
             
             if self.open_positions:
                 logger.info(f"📊 Синхронизировано {len(self.open_positions)} позиций")
@@ -869,10 +936,10 @@ class TradingBotV2:
                 
                 # Если SL отсутствует или равен 0
                 if not stop_loss or stop_loss == "" or stop_loss == "0":
-                        logger.critical(
+                    logger.critical(
                         f"🚨 {symbol}: ПОЗИЦИЯ БЕЗ SL (реальная проверка биржи)! "
-                            f"Auto-Healing активирован!"
-                        )
+                        f"Auto-Healing активирован!"
+                    )
                     health_monitor.record_error("missing_sl_order", symbol)
                     
                     # Создаем SL немедленно
@@ -1006,6 +1073,14 @@ class TradingBotV2:
                 message += f"\n━━━━━━━━━━━━━━━━━━━━━\n📊 *ПОЗИЦИИ:*"
                 for pos in self.open_positions[:3]:  # Максимум 3
                     message += f"\n  • {pos['symbol']} {pos['side'].upper()}"
+            
+            # Добавляем статистику предотвращения дублирования
+            if self.duplicate_prevention_stats['total_prevented'] > 0:
+                message += f"\n━━━━━━━━━━━━━━━━━━━━━\n🛡️ *ЗАЩИТА ОТ ДУБЛЕЙ:*"
+                message += f"\n  Предотвращено: {self.duplicate_prevention_stats['total_prevented']}"
+                message += f"\n  По позициям: {self.duplicate_prevention_stats['prevented_by_position_check']}"
+                message += f"\n  По cooldown: {self.duplicate_prevention_stats['prevented_by_cooldown']}"
+                message += f"\n  По бирже: {self.duplicate_prevention_stats['prevented_by_exchange_check']}"
             
             # Если есть проблемы - добавляем детали
             if health_report['total_errors'] > 0 or monitor_status['issues_found'] > 0:
@@ -1254,6 +1329,103 @@ class TradingBotV2:
         await update.message.reply_text("🛑 Останавливаю бота...")
         await self.shutdown()
     
+    def _load_trade_history(self):
+        """Загрузка истории торговли из файла для предотвращения дублирования сделок"""
+        try:
+            import json
+            history_file = "symbol_trade_history.json"
+            
+            try:
+                with open(history_file, 'r') as f:
+                    data = json.load(f)
+                    
+                # Конвертируем строки обратно в datetime
+                for symbol, info in data.items():
+                    if 'last_trade_time' in info:
+                        info['last_trade_time'] = datetime.fromisoformat(info['last_trade_time'])
+                
+                self.symbol_trade_history = data
+                logger.info(f"📚 Загружена история торговли: {len(data)} символов")
+                
+            except (FileNotFoundError, json.JSONDecodeError):
+                self.symbol_trade_history = {}
+                logger.info("📚 История торговли пуста - создаем новую")
+                
+        except Exception as e:
+            logger.error(f"❌ Ошибка загрузки истории торговли: {e}")
+            self.symbol_trade_history = {}
+    
+    def _save_trade_history(self):
+        """Сохранение истории торговли в файл"""
+        try:
+            import json
+            history_file = "symbol_trade_history.json"
+            
+            # Конвертируем datetime в строки для JSON
+            data_to_save = {}
+            for symbol, info in self.symbol_trade_history.items():
+                data_to_save[symbol] = {
+                    'last_trade_time': info['last_trade_time'].isoformat(),
+                    'last_side': info['last_side']
+                }
+            
+            with open(history_file, 'w') as f:
+                json.dump(data_to_save, f, indent=2)
+                
+            logger.debug(f"💾 История торговли сохранена: {len(data_to_save)} символов")
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка сохранения истории торговли: {e}")
+    
+    def _is_symbol_on_cooldown(self, symbol: str) -> bool:
+        """Проверяет находится ли символ на cooldown"""
+        if symbol not in self.symbol_trade_history:
+            return False
+        
+        last_trade_time = self.symbol_trade_history[symbol]['last_trade_time']
+        time_passed = datetime.now() - last_trade_time
+        hours_passed = time_passed.total_seconds() / 3600
+        
+        return hours_passed < self.cooldown_hours
+    
+    def _get_cooldown_remaining_hours(self, symbol: str) -> float:
+        """Возвращает оставшееся время cooldown в часах"""
+        if symbol not in self.symbol_trade_history:
+            return 0.0
+        
+        last_trade_time = self.symbol_trade_history[symbol]['last_trade_time']
+        time_passed = datetime.now() - last_trade_time
+        hours_passed = time_passed.total_seconds() / 3600
+        
+        return max(0.0, self.cooldown_hours - hours_passed)
+    
+    def _add_symbol_to_cooldown(self, symbol: str, side: str):
+        """Добавляет символ в cooldown после открытия позиции"""
+        self.symbol_trade_history[symbol] = {
+            'last_trade_time': datetime.now(),
+            'last_side': side.lower()
+        }
+        
+        # Сохраняем в файл
+        self._save_trade_history()
+        
+        logger.info(f"⏰ {symbol} {side.upper()} добавлен в cooldown на {self.cooldown_hours} часов")
+    
+    def _cleanup_expired_cooldowns(self):
+        """Очистка устаревших записей cooldown"""
+        expired_symbols = []
+        
+        for symbol in list(self.symbol_trade_history.keys()):
+            if not self._is_symbol_on_cooldown(symbol):
+                expired_symbols.append(symbol)
+        
+        for symbol in expired_symbols:
+            del self.symbol_trade_history[symbol]
+        
+        if expired_symbols:
+            logger.info(f"🧹 Очищено {len(expired_symbols)} устаревших cooldown записей")
+            self._save_trade_history()
+
     async def _check_existing_positions_on_startup(self):
         """
         КРИТИЧНО: Проверка существующих позиций при запуске бота

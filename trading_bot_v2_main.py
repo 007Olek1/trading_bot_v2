@@ -80,6 +80,17 @@ class TradingBotV2:
         # Формат: {symbol: side ("buy" или "sell")}
         self.symbol_last_side = {}
         
+        # Статистика предотвращения дублирования
+        self.duplicate_prevention_stats = {
+            'prevented_by_position_check': 0,
+            'prevented_by_cooldown': 0,
+            'prevented_by_exchange_check': 0,
+            'total_prevented': 0
+        }
+        
+        # Загружаем сохраненную историю cooldown
+        self._load_cooldown_history()
+        
         logger.info("=" * 60)
         logger.info("🤖 ТОРГОВЫЙ БОТ V2.0 ИНИЦИАЛИЗИРОВАН")
         logger.info("=" * 60)
@@ -155,7 +166,77 @@ class TradingBotV2:
         """Добавляет монету в cooldown после открытия позиции"""
         self.symbol_cooldown[symbol] = datetime.now()
         self.symbol_last_side[symbol] = side.lower()
+        
+        # Сохраняем в файл
+        self._save_cooldown_history()
+        
         logger.info(f"⏰ {symbol} {side.upper()} добавлена в cooldown на {self.cooldown_hours} часов")
+    
+    def _load_cooldown_history(self):
+        """Загрузка истории cooldown из файла"""
+        try:
+            import json
+            cooldown_file = "symbol_cooldown_v2.json"
+            
+            try:
+                with open(cooldown_file, 'r') as f:
+                    data = json.load(f)
+                
+                # Конвертируем строки обратно в datetime
+                for symbol, time_str in data.get('cooldown', {}).items():
+                    self.symbol_cooldown[symbol] = datetime.fromisoformat(time_str)
+                
+                self.symbol_last_side = data.get('last_side', {})
+                
+                logger.info(f"📚 Загружена история cooldown: {len(self.symbol_cooldown)} символов")
+                
+            except (FileNotFoundError, json.JSONDecodeError):
+                logger.info("📚 История cooldown пуста - создаем новую")
+                
+        except Exception as e:
+            logger.error(f"❌ Ошибка загрузки cooldown: {e}")
+    
+    def _save_cooldown_history(self):
+        """Сохранение истории cooldown в файл"""
+        try:
+            import json
+            cooldown_file = "symbol_cooldown_v2.json"
+            
+            # Конвертируем datetime в строки для JSON
+            cooldown_data = {}
+            for symbol, dt in self.symbol_cooldown.items():
+                cooldown_data[symbol] = dt.isoformat()
+            
+            data_to_save = {
+                'cooldown': cooldown_data,
+                'last_side': self.symbol_last_side
+            }
+            
+            with open(cooldown_file, 'w') as f:
+                json.dump(data_to_save, f, indent=2)
+                
+            logger.debug(f"💾 Cooldown история сохранена: {len(cooldown_data)} символов")
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка сохранения cooldown: {e}")
+    
+    def _cleanup_expired_cooldowns(self):
+        """Очистка устаревших записей cooldown"""
+        expired_symbols = []
+        
+        for symbol in list(self.symbol_cooldown.keys()):
+            is_cooldown, _ = self.is_symbol_on_cooldown(symbol)
+            if not is_cooldown:
+                expired_symbols.append(symbol)
+        
+        for symbol in expired_symbols:
+            del self.symbol_cooldown[symbol]
+            if symbol in self.symbol_last_side:
+                del self.symbol_last_side[symbol]
+        
+        if expired_symbols:
+            logger.info(f"🧹 Очищено {len(expired_symbols)} устаревших cooldown записей")
+            self._save_cooldown_history()
     
     async def start(self):
         """Запуск бота"""
@@ -242,6 +323,9 @@ class TradingBotV2:
             
             logger.info("✅ Бот запущен успешно!")
             logger.info("=" * 60)
+            
+            # Очищаем устаревшие записи cooldown при старте
+            self._cleanup_expired_cooldowns()
             
             # Держим бота работающим
             while self.running:
@@ -503,7 +587,30 @@ class TradingBotV2:
         try:
             logger.info(f"🚀 Открытие позиции: {symbol} {side.upper()}")
             
-            # 0. ПРОВЕРКА AI АГЕНТА
+            # 0. ДВОЙНАЯ ПРОВЕРКА НА ДУБЛИРОВАНИЕ (последняя линия защиты)
+            if any(p['symbol'] == symbol for p in self.open_positions):
+                logger.warning(f"⚠️ ДУБЛИРОВАНИЕ ПРЕДОТВРАЩЕНО: {symbol} уже есть в позициях!")
+                self.duplicate_prevention_stats['prevented_by_position_check'] += 1
+                self.duplicate_prevention_stats['total_prevented'] += 1
+                return None
+            
+            is_cooldown, hours_remaining = self.is_symbol_on_cooldown(symbol)
+            if is_cooldown:
+                logger.warning(f"⚠️ ДУБЛИРОВАНИЕ ПРЕДОТВРАЩЕНО: {symbol} на cooldown ({hours_remaining:.1f}ч)!")
+                self.duplicate_prevention_stats['prevented_by_cooldown'] += 1
+                self.duplicate_prevention_stats['total_prevented'] += 1
+                return None
+            
+            # Проверяем реальные позиции на бирже (может быть рассинхронизация)
+            real_positions = await exchange_manager.fetch_positions()
+            for pos in real_positions:
+                if pos['symbol'] == symbol and float(pos.get('contracts', 0)) > 0:
+                    logger.warning(f"⚠️ ДУБЛИРОВАНИЕ ПРЕДОТВРАЩЕНО: {symbol} уже есть на бирже!")
+                    self.duplicate_prevention_stats['prevented_by_exchange_check'] += 1
+                    self.duplicate_prevention_stats['total_prevented'] += 1
+                    return None
+            
+            # 1. ПРОВЕРКА AI АГЕНТА
             balance = await exchange_manager.get_balance()
             agent_allow, agent_reason = trading_bot_agent.should_allow_new_trade(
                 signal_confidence=signal_data.get('confidence', 0) / 100,
@@ -777,6 +884,9 @@ class TradingBotV2:
         try:
             exchange_positions = await exchange_manager.fetch_positions()
             
+            # КРИТИЧНО: Сохраняем символы текущих позиций перед очисткой
+            current_position_symbols = {p['symbol'] for p in self.open_positions}
+            
             # Обновляем наш список
             self.open_positions = []
             
@@ -827,6 +937,18 @@ class TradingBotV2:
                     }
                     
                     self.open_positions.append(position)
+            
+            # КРИТИЧНО: Добавляем в cooldown символы, которые больше не имеют позиций
+            # (значит они были закрыты и нужно предотвратить повторный вход)
+            new_position_symbols = {p['symbol'] for p in self.open_positions}
+            closed_symbols = current_position_symbols - new_position_symbols
+            
+            for symbol in closed_symbols:
+                if symbol not in self.symbol_cooldown:
+                    # Если позиция закрылась, но мы не знаем когда она была открыта,
+                    # добавляем в cooldown сейчас для безопасности
+                    self.add_symbol_to_cooldown(symbol, "unknown")
+                    logger.info(f"🛡️ {symbol} добавлен в cooldown (позиция закрыта)")
             
             if self.open_positions:
                 logger.info(f"📊 Синхронизировано {len(self.open_positions)} позиций")
@@ -1065,7 +1187,12 @@ class TradingBotV2:
                 f"{health_emoji} *ЗДОРОВЬЕ:*\n"
                 f"   Статус: {health_report['health_status']}\n"
                 f"   Ошибок: {health_report['total_errors']}\n"
-                f"   Healing попыток: {auto_healing.healing_attempts}"
+                f"   Healing попыток: {auto_healing.healing_attempts}\n\n"
+                f"🛡️ *ЗАЩИТА ОТ ДУБЛЕЙ:*\n"
+                f"   Предотвращено: {self.duplicate_prevention_stats['total_prevented']}\n"
+                f"   По позициям: {self.duplicate_prevention_stats['prevented_by_position_check']}\n"
+                f"   По cooldown: {self.duplicate_prevention_stats['prevented_by_cooldown']}\n"
+                f"   По бирже: {self.duplicate_prevention_stats['prevented_by_exchange_check']}"
             )
             
         except Exception as e:
