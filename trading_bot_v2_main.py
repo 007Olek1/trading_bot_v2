@@ -74,7 +74,7 @@ class TradingBotV2:
         # Cooldown для предотвращения повторных входов
         # Формат: {symbol: datetime последней сделки}
         self.symbol_cooldown = {}
-        self.cooldown_hours = 6  # Таймаут 6 часов между сделками по одной монете
+        self.cooldown_hours = Config.SYMBOL_COOLDOWN_HOURS  # Таймаут между сделками по одной монете
         
         # КРИТИЧНО: Также запоминаем направление последней сделки
         # Формат: {symbol: side ("buy" или "sell")}

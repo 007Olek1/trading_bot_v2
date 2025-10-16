@@ -68,6 +68,11 @@ class TradingBotV2:
             'no_signals': 0
         }
         
+        # Cooldown для предотвращения повторных входов
+        # Формат: {symbol: datetime последней сделки}
+        self.symbol_cooldown = {}
+        self.cooldown_hours = Config.SYMBOL_COOLDOWN_HOURS  # Таймаут между сделками по одной монете
+        
         # Telegram
         self.telegram_app = None
         
@@ -203,6 +208,36 @@ class TradingBotV2:
             await self.shutdown()
             raise
     
+    def is_symbol_on_cooldown(self, symbol: str) -> tuple[bool, float]:
+        """
+        Проверяет находится ли монета на cooldown
+        
+        Args:
+            symbol: Символ монеты
+        
+        Returns:
+            (is_cooldown, hours_remaining)
+        """
+        if symbol not in self.symbol_cooldown:
+            return False, 0.0
+        
+        last_trade_time = self.symbol_cooldown[symbol]
+        time_passed = datetime.now() - last_trade_time
+        hours_passed = time_passed.total_seconds() / 3600
+        
+        if hours_passed >= self.cooldown_hours:
+            # Cooldown истёк, удаляем из словаря
+            del self.symbol_cooldown[symbol]
+            return False, 0.0
+        
+        hours_remaining = self.cooldown_hours - hours_passed
+        return True, hours_remaining
+    
+    def add_symbol_to_cooldown(self, symbol: str, side: str):
+        """Добавляет монету в cooldown после открытия позиции"""
+        self.symbol_cooldown[symbol] = datetime.now()
+        logger.info(f"⏰ {symbol} {side.upper()} добавлена в cooldown на {self.cooldown_hours} часов")
+    
     async def trading_loop(self):
         """Основной торговый цикл"""
         try:
@@ -300,6 +335,12 @@ class TradingBotV2:
             for symbol in symbols:
                 # Пропускаем если уже есть позиция
                 if any(p['symbol'] == symbol for p in self.open_positions):
+                    continue
+                
+                # ПРОВЕРКА COOLDOWN - предотвращаем повторные входы
+                is_cooldown, hours_remaining = self.is_symbol_on_cooldown(symbol)
+                if is_cooldown:
+                    logger.debug(f"⏰ {symbol} на cooldown (осталось {hours_remaining:.1f}ч)")
                     continue
                 
                 # Получаем ПОЛНЫЙ анализ (включая сигналы 85%+)
@@ -768,6 +809,10 @@ class TradingBotV2:
             )
             
             logger.info(f"✅ Позиция {symbol} успешно открыта с защитой!")
+            
+            # Добавляем монету в cooldown
+            self.add_symbol_to_cooldown(symbol, side)
+            
             return position
             
         except Exception as e:
