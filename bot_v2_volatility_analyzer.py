@@ -222,10 +222,10 @@ class EnhancedSymbolSelector:
         self.cached_symbols = []
     
     async def get_volatile_symbols(self, exchange_manager, top_n: int = 50) -> List[Dict[str, Any]]:
-        """Получить волатильные символы с анализом"""
+        """Получить волатильные символы с анализом - теперь анализирует ВСЕ доступные монеты"""
         try:
-            # Получаем базовый список топ символов
-            base_symbols = await exchange_manager.get_top_volume_symbols(top_n=200)
+            # Получаем РАСШИРЕННЫЙ список символов для максимального охвата
+            base_symbols = await exchange_manager.get_top_volume_symbols(top_n=300)  # Увеличено до 300
             
             if not base_symbols:
                 logger.warning("⚠️ Не удалось получить базовые символы")
@@ -235,30 +235,40 @@ class EnhancedSymbolSelector:
             filtered_symbols = self._filter_problematic_symbols(base_symbols)
             logger.info(f"🔍 После фильтрации: {len(filtered_symbols)} символов (было {len(base_symbols)})")
             
-            logger.info(f"🔍 Анализирую волатильность {len(filtered_symbols)} символов...")
+            logger.info(f"🔍 Анализирую волатильность ВСЕХ {len(filtered_symbols)} доступных символов...")
             
-            # Анализируем волатильность для каждого символа
+            # Анализируем волатильность для ВСЕХ отфильтрованных символов (не ограничиваем 150)
             analysis_tasks = []
-            for symbol in filtered_symbols[:150]:  # Увеличено для большего охвата
+            for symbol in filtered_symbols:  # Убрали ограничение [:150]
                 task = self.volatility_analyzer.analyze_symbol_volatility(symbol, exchange_manager)
                 analysis_tasks.append(task)
             
-            # Выполняем анализ параллельно
-            results = await asyncio.gather(*analysis_tasks, return_exceptions=True)
-            
-            # Фильтруем результаты
+            # Выполняем анализ батчами для контроля нагрузки
+            batch_size = 50
             valid_results = []
-            for result in results:
-                if isinstance(result, dict) and result.get('total_score', 0) > 0:
-                    valid_results.append(result)
+            
+            for i in range(0, len(analysis_tasks), batch_size):
+                batch_tasks = analysis_tasks[i:i + batch_size]
+                logger.info(f"📊 Анализирую батч {i//batch_size + 1}/{(len(analysis_tasks) + batch_size - 1)//batch_size} ({len(batch_tasks)} символов)...")
+                
+                # Выполняем батч параллельно
+                batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+                
+                # Фильтруем результаты батча
+                for result in batch_results:
+                    if isinstance(result, dict) and result.get('total_score', 0) > 0:
+                        valid_results.append(result)
+                
+                # Небольшая пауза между батчами
+                await asyncio.sleep(0.2)
             
             # Сортируем по общему скору
             valid_results.sort(key=lambda x: x['total_score'], reverse=True)
             
-            # Берем топ N
+            # Берем топ N (но теперь из ВСЕХ доступных монет)
             top_volatile = valid_results[:top_n]
             
-            logger.info(f"📊 Найдено {len(top_volatile)} волатильных символов")
+            logger.info(f"📊 Найдено {len(top_volatile)} лучших волатильных символов из {len(valid_results)} проанализированных")
             
             # Логируем топ 10
             for i, symbol_data in enumerate(top_volatile[:10]):
@@ -283,6 +293,10 @@ class EnhancedSymbolSelector:
         """Получить кэшированные символы"""
         return [symbol_data['symbol'] for symbol_data in self.cached_symbols]
     
+    def has_cached_symbols(self) -> bool:
+        """Проверить наличие кэшированных символов"""
+        return len(self.cached_symbols) > 0 and self.is_cache_valid()
+    
     def is_cache_valid(self) -> bool:
         """Проверить валидность кэша"""
         if not self.last_analysis_time:
@@ -294,7 +308,7 @@ class EnhancedSymbolSelector:
     def _filter_problematic_symbols(self, symbols: List[str]) -> List[str]:
         """Фильтрация малоликвидных и проблемных символов"""
         try:
-            # Список исключений - малоликвидные монеты
+            # Расширенный список исключений - малоликвидные и проблемные монеты
             excluded_symbols = {
                 # Малоликвидные токены
                 'XPIN/USDT:USDT', 'KGEN/USDT:USDT', 'TWT/USDT:USDT', 'IN/USDT:USDT',
@@ -305,17 +319,26 @@ class EnhancedSymbolSelector:
                 'GALA/USDT:USDT', 'SAND/USDT:USDT', 'MANA/USDT:USDT', 'AXS/USDT:USDT',
                 'IMX/USDT:USDT', 'APE/USDT:USDT', 'GMT/USDT:USDT', 'GAL/USDT:USDT',
                 
-                # Слишком волатильные мемкоины
-                'DOGE/USDT:USDT', 'SHIB/USDT:USDT', 'PEPE/USDT:USDT', 'FLOKI/USDT:USDT',
-                'BONK/USDT:USDT', 'WIF/USDT:USDT', 'MEME/USDT:USDT', 'BABYDOGE/USDT:USDT',
+                # Слишком волатильные мемкоины (оставляем только самые проблемные)
+                'PEPE/USDT:USDT', 'FLOKI/USDT:USDT', 'BONK/USDT:USDT', 'WIF/USDT:USDT', 
+                'MEME/USDT:USDT', 'BABYDOGE/USDT:USDT', 'ELON/USDT:USDT', 'AKITA/USDT:USDT',
                 
-                # Проблемные DeFi токены
+                # Проблемные DeFi токены (убираем популярные вроде AAVE, UNI)
                 'CRV/USDT:USDT', 'SNX/USDT:USDT', 'COMP/USDT:USDT', 'MKR/USDT:USDT',
-                'AAVE/USDT:USDT', 'UNI/USDT:USDT', 'SUSHI/USDT:USDT', '1INCH/USDT:USDT',
+                'SUSHI/USDT:USDT', '1INCH/USDT:USDT', 'YFI/USDT:USDT', 'BAL/USDT:USDT',
                 
                 # Низколиквидные альткоины
                 'STORJ/USDT:USDT', 'ANKR/USDT:USDT', 'BAT/USDT:USDT', 'ZRX/USDT:USDT',
-                'KNC/USDT:USDT', 'REN/USDT:USDT', 'LRC/USDT:USDT', 'OMG/USDT:USDT'
+                'KNC/USDT:USDT', 'REN/USDT:USDT', 'LRC/USDT:USDT', 'OMG/USDT:USDT',
+                
+                # Дополнительные малоликвидные
+                'DENT/USDT:USDT', 'RSR/USDT:USDT', 'SKL/USDT:USDT', 'CELR/USDT:USDT',
+                'CTK/USDT:USDT', 'ALPHA/USDT:USDT', 'BETA/USDT:USDT', 'TLM/USDT:USDT',
+                'SLP/USDT:USDT', 'PYR/USDT:USDT', 'GHST/USDT:USDT', 'SUPER/USDT:USDT',
+                
+                # Стейблкоины и wrapped токены (не нужны для торговли)
+                'USDC/USDT:USDT', 'BUSD/USDT:USDT', 'DAI/USDT:USDT', 'TUSD/USDT:USDT',
+                'WBTC/USDT:USDT', 'WETH/USDT:USDT', 'stETH/USDT:USDT'
             }
             
             # Фильтруем символы
