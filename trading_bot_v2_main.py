@@ -61,6 +61,8 @@ class TradingBotV2:
         self.open_positions: List[Dict[str, Any]] = []
         self.bot_errors_count = 0
         self.last_heartbeat = datetime.now()
+        # Символы, по которым прямо сейчас идет открытие позиции (анти-дубликаты)
+        self.pending_symbols = set()
         
         # Статистика сигналов
         self.signals_stats = {
@@ -346,6 +348,11 @@ class TradingBotV2:
                 if len(self.open_positions) >= Config.MAX_POSITIONS:
                     break
                 
+                # Пропускаем, если по символу уже идет процесс открытия (защита от дубликатов)
+                if symbol in self.pending_symbols:
+                    logger.debug(f"⏳ Пропуск {symbol}: открытие уже в процессе")
+                    continue
+
                 # Пропускаем если уже есть позиция
                 if any(p['symbol'] == symbol for p in self.open_positions):
                     continue
@@ -361,11 +368,15 @@ class TradingBotV2:
                 
                 if signal_result and signal_result.get('signal'):
                     # Пытаемся открыть сделку
-                    position = await self.open_position(
-                        symbol=symbol,
-                        side=signal_result['signal'],
-                        signal_data=signal_result
-                    )
+                    self.pending_symbols.add(symbol)
+                    try:
+                        position = await self.open_position(
+                            symbol=symbol,
+                            side=signal_result['signal'],
+                            signal_data=signal_result
+                        )
+                    finally:
+                        self.pending_symbols.discard(symbol)
                     
                     if position:
                         logger.info(f"✅ Позиция открыта: {symbol}")
@@ -524,6 +535,16 @@ class TradingBotV2:
                 return None
             
             current_price = float(ohlcv[-1][4])  # close price
+
+            # 1.1 Доп. защита: перед входом убеждаемся, что позиции по символу НЕТ на бирже
+            try:
+                live_positions = await exchange_manager.fetch_positions()
+                if any(p.get('symbol') == symbol and float(p.get('contracts', 0) or 0) > 0 for p in live_positions):
+                    logger.warning(f"🛑 Пропуск открытия {symbol}: позиция уже существует на бирже")
+                    return None
+            except Exception as _:
+                # Не блокируем из-за временной ошибки проверки, просто продолжаем
+                pass
             
             # 2. Устанавливаем леверидж
             await exchange_manager.set_leverage(symbol, Config.LEVERAGE)
