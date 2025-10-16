@@ -75,11 +75,11 @@ trend_strength = (ema_trend * 0.3 + macd_trend * 0.3 + momentum_trend * 0.3 + vo
 ### **Этап 1: Получение кандидатов**
 ```python
 # Получаем топ-200 по объему
-base_symbols = await exchange_manager.get_top_volume_symbols(top_n=200)
+base_symbols = await exchange_manager.get_top_volume_symbols(top_n=300)
 
 # Анализируем первые 100 (для скорости)
 analysis_tasks = []
-for symbol in base_symbols[:100]:
+for symbol in base_symbols[:150]:
     task = volatility_analyzer.analyze_symbol_volatility(symbol, exchange_manager)
     analysis_tasks.append(task)
 
