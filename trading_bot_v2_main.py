@@ -79,6 +79,11 @@ class TradingBotV2:
         # КРИТИЧНО: Также запоминаем направление последней сделки
         # Формат: {symbol: side ("buy" или "sell")}
         self.symbol_last_side = {}
+
+        # Защита от дублей: локи на символ и метрика предотвращенных дублей
+        import asyncio as _asyncio  # локальный псевдоним, чтобы не затенять глобальный импорт
+        self._symbol_locks: Dict[str, _asyncio.Lock] = {}
+        self.duplicate_prevented: int = 0
         
         logger.info("=" * 60)
         logger.info("🤖 ТОРГОВЫЙ БОТ V2.0 ИНИЦИАЛИЗИРОВАН")
@@ -251,6 +256,28 @@ class TradingBotV2:
             logger.error(f"❌ Критическая ошибка запуска: {e}")
             await self.shutdown()
             raise
+
+    def _get_symbol_lock(self, symbol: str):
+        """Получить (или создать) лок для конкретного символа."""
+        import asyncio as _asyncio
+        lock = self._symbol_locks.get(symbol)
+        if lock is None:
+            lock = _asyncio.Lock()
+            self._symbol_locks[symbol] = lock
+        return lock
+
+    async def _has_active_position_on_exchange(self, symbol: str) -> bool:
+        """Проверить на бирже, есть ли уже открытая позиция по символу."""
+        try:
+            positions = await exchange_manager.fetch_positions()
+            for pos in positions:
+                if pos.get('symbol') == symbol and float(pos.get('contracts', 0) or 0) > 0:
+                    return True
+            return False
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалось проверить позиции на бирже для {symbol}: {e}")
+            # В случае ошибки — безопаснее НЕ открывать дубликат
+            return True
     
     async def trading_loop(self):
         """Основной торговый цикл"""
@@ -501,272 +528,293 @@ class TradingBotV2:
         Критически важно: SL ордер ОБЯЗАТЕЛЕН!
         """
         try:
-            logger.info(f"🚀 Открытие позиции: {symbol} {side.upper()}")
-            
-            # 0. ПРОВЕРКА AI АГЕНТА
-            balance = await exchange_manager.get_balance()
-            agent_allow, agent_reason = trading_bot_agent.should_allow_new_trade(
-                signal_confidence=signal_data.get('confidence', 0) / 100,
-                balance=balance
-            )
-            
-            if not agent_allow:
-                logger.warning(f"🤖 Агент заблокировал сделку: {agent_reason}")
-                health_monitor.record_error("agent_block", agent_reason)
-                return None
-            
-            logger.info(f"🤖 Агент РАЗРЕШИЛ сделку: {agent_reason}")
-            
-            # 1. Получаем текущую цену
-            ohlcv = await exchange_manager.fetch_ohlcv(symbol, limit=1)
-            if not ohlcv:
-                logger.error("❌ Не удалось получить цену")
-                return None
-            
-            current_price = float(ohlcv[-1][4])  # close price
-            
-            # 2. Устанавливаем леверидж
-            await exchange_manager.set_leverage(symbol, Config.LEVERAGE)
-            
-            # 3. Рассчитываем размер позиции
-            balance = await exchange_manager.get_balance()
-            position_size_usd = risk_manager.calculate_position_size(balance)
-            amount = (position_size_usd * Config.LEVERAGE) / current_price
-            
-            # 4. Рассчитываем SL и TP
-            stop_loss, take_profit = risk_manager.calculate_sl_tp_prices(current_price, side)
-            sl_pct = self.format_price_change_pct(current_price, stop_loss, side)
-            tp_pct = self.format_price_change_pct(current_price, take_profit, side)
-            logger.info(f"🎯 SL/TP: вход=${current_price:.4f}, SL=${stop_loss:.4f} ({sl_pct}), TP=${take_profit:.4f} ({tp_pct})")
-            
-            # 5. Открываем позицию на бирже
-            logger.info(f"💰 Создаю market ордер: {amount:.6f} @ ${current_price:.4f}")
-            market_order = await exchange_manager.create_market_order(symbol, side, amount)
-            
-            if not market_order:
-                logger.error("❌ Не удалось создать market ордер")
-                return None
-            
-            # КРИТИЧНО: Получаем ФАКТИЧЕСКИЙ размер позиции с биржи (может быть округлен!)
-            import asyncio
-            await asyncio.sleep(0.5)  # Даем бирже время обработать ордер
-            positions = await exchange_manager.fetch_positions()
-            actual_amount = amount  # По умолчанию используем расчетный
-            
-            for pos in positions:
-                if pos['symbol'] == symbol and float(pos.get('contracts', 0)) > 0:
-                    actual_amount = float(pos.get('contracts', 0))
-                    logger.info(f"📊 Фактический размер позиции: {actual_amount} (расчетный был {amount:.6f})")
-                    break
-            
-            # 6. КРИТИЧНО: Создаем Stop Loss ордер НА БИРЖЕ
-            logger.info("🛡️ Создаю Stop Loss ордер на бирже...")
-            close_side = "sell" if side == "buy" else "buy"
-            
-            sl_order = await exchange_manager.create_stop_market_order(
-                symbol=symbol,
-                side=close_side,
-                amount=actual_amount,  # Используем фактический размер!
-                stop_price=stop_loss
-            )
-            
-            # ПРОВЕРКА: SL ордер создан?
-            if not sl_order or not sl_order.get('id'):
-                logger.critical(f"🚨 КРИТИЧНО: SL ордер НЕ СОЗДАН для {symbol}!")
-                
-                # ЗАКРЫВАЕМ ПОЗИЦИЮ НЕМЕДЛЕННО!
-                logger.warning("⚠️ Закрываю позицию без SL...")
-                await exchange_manager.create_market_order(symbol, close_side, amount)
-                
-                await self.send_telegram(
-                    f"🚨 КРИТИЧЕСКАЯ ОШИБКА!\n\n"
-                    f"Не удалось создать SL ордер для {symbol}\n"
-                    f"Позиция немедленно закрыта!\n"
-                    f"Проверьте настройки биржи!"
+            async with self._get_symbol_lock(symbol):
+                # Повторная проверка перед открытием (в памяти)
+                if any(p['symbol'] == symbol for p in self.open_positions):
+                    self.duplicate_prevented += 1
+                    logger.warning(f"🧯 Дубликат предотвращен (в памяти): позиция по {symbol} уже открыта")
+                    return None
+
+                # И финальная проверка на бирже (межпроцессная защита)
+                if await self._has_active_position_on_exchange(symbol):
+                    self.duplicate_prevented += 1
+                    logger.warning(f"🧯 Дубликат предотвращен (биржа): активная позиция по {symbol} уже существует")
+                    return None
+
+                logger.info(f"🚀 Открытие позиции: {symbol} {side.upper()}")
+
+                # 0. ПРОВЕРКА AI АГЕНТА
+                balance = await exchange_manager.get_balance()
+                agent_allow, agent_reason = trading_bot_agent.should_allow_new_trade(
+                    signal_confidence=signal_data.get('confidence', 0) / 100,
+                    balance=balance
                 )
-                
-                return None
-            
-            logger.info(f"✅ SL ордер создан: {sl_order['id']}")
-            
-            # 7. Создаем МНОГОУРОВНЕВЫЙ Take Profit (с учетом минимального размера биржи)
-            logger.info("🎯 Создаю многоуровневый Take Profit...")
-            
-            # Получаем минимальный размер ордера для этой монеты
-            try:
-                market = await exchange_manager.exchange.load_markets()
-                market_info = market.get(symbol, {})
-                min_amount = market_info.get('limits', {}).get('amount', {}).get('min', 0.01)
-                logger.debug(f"📏 Минимальный размер для {symbol}: {min_amount}")
-            except Exception as e:
-                logger.warning(f"⚠️ Не удалось получить минимальный размер, использую 0.01: {e}")
-                min_amount = 0.01
-            
-            # Адаптивные уровни TP на основе сигнала и волатильности
-            tp_levels = self.calculate_adaptive_tp_levels(signal_data, current_price)
-            
-            # АВТОМАТИЧЕСКОЕ ОПРЕДЕЛЕНИЕ КОЛИЧЕСТВА TP УРОВНЕЙ
-            # Определяем сколько уровней можем создать исходя из минимального размера
-            max_tp_levels = 5  # Желаемое количество
-            
-            # Пробуем создать максимум уровней, но если размер < минимума, уменьшаем количество
-            num_tp_levels = max_tp_levels
-            for num_levels in [5, 3, 2, 1]:
-                tp_amount_per_level = actual_amount / num_levels
-                if tp_amount_per_level >= min_amount:
-                    num_tp_levels = num_levels
-                    break
-            else:
-                # Если даже вся позиция < минимума
-                num_tp_levels = 1
-                tp_amount_per_level = actual_amount
-            
-            logger.info(
-                f"🎯 TP стратегия: {num_tp_levels} уровней по {tp_amount_per_level:.6f} каждый "
-                f"(мин={min_amount:.6f})"
-            )
-            logger.info(
-                f"🎯 TP уровни: {[f'{l*100:.1f}%' for l in tp_levels]} "
-                f"(ROI при 5X: {[f'{l*100*Config.LEVERAGE:.1f}%' for l in tp_levels]})"
-            )
-            
-            # Если можем создать только 1 TP - берём средний уровень
-            if num_tp_levels == 1:
-                logger.warning(
-                    f"⚠️ Размер уровня {tp_amount_per_level:.6f} < минимум {min_amount:.6f}. "
-                    f"Создаю 1 TP ордер на всю позицию"
+
+                if not agent_allow:
+                    logger.warning(f"🤖 Агент заблокировал сделку: {agent_reason}")
+                    health_monitor.record_error("agent_block", agent_reason)
+                    return None
+
+                logger.info(f"🤖 Агент РАЗРЕШИЛ сделку: {agent_reason}")
+
+                # 1. Получаем текущую цену
+                ohlcv = await exchange_manager.fetch_ohlcv(symbol, limit=1)
+                if not ohlcv:
+                    logger.error("❌ Не удалось получить цену")
+                    return None
+
+                current_price = float(ohlcv[-1][4])  # close price
+
+                # 2. Устанавливаем леверидж
+                await exchange_manager.set_leverage(symbol, Config.LEVERAGE)
+
+                # 3. Рассчитываем размер позиции
+                balance = await exchange_manager.get_balance()
+                position_size_usd = risk_manager.calculate_position_size(balance)
+                amount = (position_size_usd * Config.LEVERAGE) / current_price
+
+                # 4. Рассчитываем SL и TP
+                stop_loss, take_profit = risk_manager.calculate_sl_tp_prices(current_price, side)
+                sl_pct = self.format_price_change_pct(current_price, stop_loss, side)
+                tp_pct = self.format_price_change_pct(current_price, take_profit, side)
+                logger.info(
+                    f"🎯 SL/TP: вход=${current_price:.4f}, SL=${stop_loss:.4f} ({sl_pct}), TP=${take_profit:.4f} ({tp_pct})"
                 )
-                # Берем средний уровень (1.9% = 9.5% ROI при 5X)
-                tp_level = 0.019
-                if side == "buy":
-                    tp_price = current_price * (1 + tp_level)
-                else:
-                    tp_price = current_price * (1 - tp_level)
-                
-                try:
-                    tp_order = await exchange_manager.create_limit_order(
-                        symbol=symbol,
-                        side=close_side,
-                        amount=actual_amount,  # ВСЯ ФАКТИЧЕСКАЯ позиция
-                        price=round(tp_price, 4)
+
+                # 5. Открываем позицию на бирже
+                logger.info(f"💰 Создаю market ордер: {amount:.6f} @ ${current_price:.4f}")
+                market_order = await exchange_manager.create_market_order(symbol, side, amount)
+
+                if not market_order:
+                    logger.error("❌ Не удалось создать market ордер")
+                    return None
+
+                # КРИТИЧНО: Получаем ФАКТИЧЕСКИЙ размер позиции с биржи (может быть округлен!)
+                import asyncio
+                await asyncio.sleep(0.5)  # Даем бирже время обработать ордер
+                positions = await exchange_manager.fetch_positions()
+                actual_amount = amount  # По умолчанию используем расчетный
+
+                for pos in positions:
+                    if pos['symbol'] == symbol and float(pos.get('contracts', 0)) > 0:
+                        actual_amount = float(pos.get('contracts', 0))
+                        logger.info(
+                            f"📊 Фактический размер позиции: {actual_amount} (расчетный был {amount:.6f})"
+                        )
+                        break
+
+                # 6. КРИТИЧНО: Создаем Stop Loss ордер НА БИРЖЕ
+                logger.info("🛡️ Создаю Stop Loss ордер на бирже...")
+                close_side = "sell" if side == "buy" else "buy"
+
+                sl_order = await exchange_manager.create_stop_market_order(
+                    symbol=symbol,
+                    side=close_side,
+                    amount=actual_amount,  # Используем фактический размер!
+                    stop_price=stop_loss
+                )
+
+                # ПРОВЕРКА: SL ордер создан?
+                if not sl_order or not sl_order.get('id'):
+                    logger.critical(f"🚨 КРИТИЧНО: SL ордер НЕ СОЗДАН для {symbol}!")
+
+                    # ЗАКРЫВАЕМ ПОЗИЦИЮ НЕМЕДЛЕННО!
+                    logger.warning("⚠️ Закрываю позицию без SL...")
+                    await exchange_manager.create_market_order(symbol, close_side, amount)
+
+                    await self.send_telegram(
+                        f"🚨 КРИТИЧЕСКАЯ ОШИБКА!\n\n"
+                        f"Не удалось создать SL ордер для {symbol}\n"
+                        f"Позиция немедленно закрыта!\n"
+                        f"Проверьте настройки биржи!"
                     )
-                    
-                    if tp_order and tp_order.get('id'):
-                        tp_orders = [tp_order]
-                        logger.info(f"✅ TP создан @ ${tp_price:.4f} (+{tp_level*100:.1f}% = +{tp_level*100*Config.LEVERAGE:.1f}% ROI)")
-                    else:
-                        logger.warning(f"⚠️ Не удалось создать TP")
-                        tp_orders = []
+
+                    return None
+
+                logger.info(f"✅ SL ордер создан: {sl_order['id']}")
+
+                # 7. Создаем МНОГОУРОВНЕВЫЙ Take Profit (с учетом минимального размера биржи)
+                logger.info("🎯 Создаю многоуровневый Take Profit...")
+
+                # Получаем минимальный размер ордера для этой монеты
+                try:
+                    market = await exchange_manager.exchange.load_markets()
+                    market_info = market.get(symbol, {})
+                    min_amount = market_info.get('limits', {}).get('amount', {}).get('min', 0.01)
+                    logger.debug(f"📏 Минимальный размер для {symbol}: {min_amount}")
                 except Exception as e:
-                    logger.error(f"❌ Ошибка создания TP: {e}")
-                    tp_orders = []
-            else:
-                # Создаем N уровней TP (автоматически определено выше)
-                tp_orders = []
-                
-                # Выбираем нужное количество уровней из массива tp_levels
-                if num_tp_levels == 5:
-                    selected_levels = tp_levels  # Все 5 уровней
-                elif num_tp_levels == 3:
-                    selected_levels = [tp_levels[0], tp_levels[2], tp_levels[4]]  # 1, 3, 5
-                elif num_tp_levels == 2:
-                    selected_levels = [tp_levels[1], tp_levels[4]]  # 2, 5
+                    logger.warning(f"⚠️ Не удалось получить минимальный размер, использую 0.01: {e}")
+                    min_amount = 0.01
+
+                # Адаптивные уровни TP на основе сигнала и волатильности
+                tp_levels = self.calculate_adaptive_tp_levels(signal_data, current_price)
+
+                # АВТОМАТИЧЕСКОЕ ОПРЕДЕЛЕНИЕ КОЛИЧЕСТВА TP УРОВНЕЙ
+                # Определяем сколько уровней можем создать исходя из минимального размера
+                max_tp_levels = 5  # Желаемое количество
+
+                # Пробуем создать максимум уровней, но если размер < минимума, уменьшаем количество
+                num_tp_levels = max_tp_levels
+                for num_levels in [5, 3, 2, 1]:
+                    tp_amount_per_level = actual_amount / num_levels
+                    if tp_amount_per_level >= min_amount:
+                        num_tp_levels = num_levels
+                        break
                 else:
-                    selected_levels = [tp_levels[2]]  # Средний уровень
-                
-                for i, level in enumerate(selected_levels, 1):
+                    # Если даже вся позиция < минимума
+                    num_tp_levels = 1
+                    tp_amount_per_level = actual_amount
+
+                logger.info(
+                    f"🎯 TP стратегия: {num_tp_levels} уровней по {tp_amount_per_level:.6f} каждый "
+                    f"(мин={min_amount:.6f})"
+                )
+                logger.info(
+                    f"🎯 TP уровни: {[f'{l*100:.1f}%' for l in tp_levels]} "
+                    f"(ROI при 5X: {[f'{l*100*Config.LEVERAGE:.1f}%' for l in tp_levels]})"
+                )
+
+                # Если можем создать только 1 TP - берём средний уровень
+                if num_tp_levels == 1:
+                    logger.warning(
+                        f"⚠️ Размер уровня {tp_amount_per_level:.6f} < минимум {min_amount:.6f}. "
+                        f"Создаю 1 TP ордер на всю позицию"
+                    )
+                    # Берем средний уровень (1.9% = 9.5% ROI при 5X)
+                    tp_level = 0.019
                     if side == "buy":
-                        tp_price = current_price * (1 + level)
+                        tp_price = current_price * (1 + tp_level)
                     else:
-                        tp_price = current_price * (1 - level)
-                    
+                        tp_price = current_price * (1 - tp_level)
+
                     try:
                         tp_order = await exchange_manager.create_limit_order(
                             symbol=symbol,
                             side=close_side,
-                            amount=tp_amount_per_level,
+                            amount=actual_amount,  # ВСЯ ФАКТИЧЕСКАЯ позиция
                             price=round(tp_price, 4)
                         )
-                        
+
                         if tp_order and tp_order.get('id'):
-                            tp_orders.append(tp_order)
-                            logger.info(f"✅ TP{i} создан @ ${tp_price:.4f} ({self.format_price_change_pct(current_price, tp_price, side)})")
+                            tp_orders = [tp_order]
+                            logger.info(
+                                f"✅ TP создан @ ${tp_price:.4f} (+{tp_level*100:.1f}% = +{tp_level*100*Config.LEVERAGE:.1f}% ROI)"
+                            )
                         else:
-                            logger.warning(f"⚠️ Не удалось создать TP{i}")
+                            logger.warning(f"⚠️ Не удалось создать TP")
+                            tp_orders = []
                     except Exception as e:
-                        logger.error(f"❌ Ошибка создания TP{i}: {e}")
-            
-            # 8. Создаем запись о позиции
-            position = {
-                "symbol": symbol,
-                "side": side,
-                "entry_price": current_price,
-                "amount": actual_amount,  # ФАКТИЧЕСКИЙ размер с биржи!
-                "stop_loss": stop_loss,
-                "take_profit": take_profit,
-                "sl_order_id": sl_order['id'],
-                "tp_order_id": tp_orders[0]['id'] if tp_orders else None,  # Первый TP
-                "market_order_id": market_order['id'],
-                "open_time": datetime.now(),
-                "signal_confidence": signal_data['confidence'],
-                "signal_reason": signal_data['reason']
-            }
-            
-            self.open_positions.append(position)
-            
-            # 9. Уведомление с многоуровневым TP
-            invested = position_size_usd  # Сколько вложено (без leverage)
-            
-            # Формируем текст с TP уровнями с ПРАВИЛЬНЫМИ знаками
-            # Используем те же уровни что и в ордерах
-            if num_tp_levels == 5:
-                display_levels = tp_levels
-            elif num_tp_levels == 3:
-                display_levels = [tp_levels[0], tp_levels[2], tp_levels[4]]
-            elif num_tp_levels == 2:
-                display_levels = [tp_levels[1], tp_levels[4]]
-            else:
-                display_levels = [tp_levels[2]]
-            
-            targets_text = ""
-            emojis = ["🥇", "🥈", "🥉", "💎", "🚀"]
-            for i, level in enumerate(display_levels, 1):
-                if side == "buy":
-                    tp_price = current_price * (1 + level)
+                        logger.error(f"❌ Ошибка создания TP: {e}")
+                        tp_orders = []
                 else:
-                    tp_price = current_price * (1 - level)
-                
-                # Правильный процент с знаком
-                tp_pct_str = self.format_price_change_pct(current_price, tp_price, side)
-                tp_pct = level * 100
-                profit_usd = invested * (tp_pct / 100) * Config.LEVERAGE
-                
-                emoji = emojis[i-1] if i <= len(emojis) else "🎯"
-                targets_text += f"   {emoji} ${tp_price:.4f} ({tp_pct_str} = +${profit_usd:.2f})\n"
-            
-            # SL с правильным знаком и убыток в $
-            sl_pct_str = self.format_price_change_pct(current_price, stop_loss, side)
-            sl_pct = abs((stop_loss - current_price) / current_price * 100)
-            loss_usd = invested * (sl_pct / 100) * Config.LEVERAGE
-            
-            await self.send_telegram(
-                f"🟢 ПОЗИЦИЯ ОТКРЫТА\n\n"
-                f"💎 {symbol} | {side.upper()} | {Config.LEVERAGE}X\n"
-                f"💰 Entry: ${current_price:.4f}\n"
-                f"💵 Инвестировано: ${invested:.2f}\n\n"
-                f"🎯 Targets:\n{targets_text}\n"
-                f"🛡️ Stop Loss: ${stop_loss:.4f} ({sl_pct_str} = -${loss_usd:.2f})\n\n"
-                f"🎲 Уверенность: {signal_data['confidence']:.0f}%\n"
-                f"⏰ {datetime.now().strftime('%H:%M:%S')}"
-            )
-            
-            logger.info(f"✅ Позиция {symbol} успешно открыта с защитой!")
-            
-            # Добавляем монету в cooldown с указанием направления
-            self.add_symbol_to_cooldown(symbol, side)
-            
-            return position
-            
+                    # Создаем N уровней TP (автоматически определено выше)
+                    tp_orders = []
+
+                    # Выбираем нужное количество уровней из массива tp_levels
+                    if num_tp_levels == 5:
+                        selected_levels = tp_levels  # Все 5 уровней
+                    elif num_tp_levels == 3:
+                        selected_levels = [tp_levels[0], tp_levels[2], tp_levels[4]]  # 1, 3, 5
+                    elif num_tp_levels == 2:
+                        selected_levels = [tp_levels[1], tp_levels[4]]  # 2, 5
+                    else:
+                        selected_levels = [tp_levels[2]]  # Средний уровень
+
+                    for i, level in enumerate(selected_levels, 1):
+                        if side == "buy":
+                            tp_price = current_price * (1 + level)
+                        else:
+                            tp_price = current_price * (1 - level)
+
+                        try:
+                            tp_order = await exchange_manager.create_limit_order(
+                                symbol=symbol,
+                                side=close_side,
+                                amount=tp_amount_per_level,
+                                price=round(tp_price, 4)
+                            )
+
+                            if tp_order and tp_order.get('id'):
+                                tp_orders.append(tp_order)
+                                logger.info(
+                                    f"✅ TP{i} создан @ ${tp_price:.4f} ({self.format_price_change_pct(current_price, tp_price, side)})"
+                                )
+                            else:
+                                logger.warning(f"⚠️ Не удалось создать TP{i}")
+                        except Exception as e:
+                            logger.error(f"❌ Ошибка создания TP{i}: {e}")
+
+                # 8. Создаем запись о позиции
+                position = {
+                    "symbol": symbol,
+                    "side": side,
+                    "entry_price": current_price,
+                    "amount": actual_amount,  # ФАКТИЧЕСКИЙ размер с биржи!
+                    "stop_loss": stop_loss,
+                    "take_profit": take_profit,
+                    "sl_order_id": sl_order['id'],
+                    "tp_order_id": tp_orders[0]['id'] if tp_orders else None,  # Первый TP
+                    "market_order_id": market_order['id'],
+                    "open_time": datetime.now(),
+                    "signal_confidence": signal_data['confidence'],
+                    "signal_reason": signal_data['reason']
+                }
+
+                self.open_positions.append(position)
+
+                # 9. Уведомление с многоуровневым TP
+                invested = position_size_usd  # Сколько вложено (без leverage)
+
+                # Формируем текст с TP уровнями с ПРАВИЛЬНЫМИ знаками
+                # Используем те же уровни что и в ордерах
+                if num_tp_levels == 5:
+                    display_levels = tp_levels
+                elif num_tp_levels == 3:
+                    display_levels = [tp_levels[0], tp_levels[2], tp_levels[4]]
+                elif num_tp_levels == 2:
+                    display_levels = [tp_levels[1], tp_levels[4]]
+                else:
+                    display_levels = [tp_levels[2]]
+
+                targets_text = ""
+                emojis = ["🥇", "🥈", "🥉", "💎", "🚀"]
+                for i, level in enumerate(display_levels, 1):
+                    if side == "buy":
+                        tp_price = current_price * (1 + level)
+                    else:
+                        tp_price = current_price * (1 - level)
+
+                    # Правильный процент с знаком
+                    tp_pct_str = self.format_price_change_pct(current_price, tp_price, side)
+                    tp_pct = level * 100
+                    profit_usd = invested * (tp_pct / 100) * Config.LEVERAGE
+
+                    emoji = emojis[i-1] if i <= len(emojis) else "🎯"
+                    targets_text += f"   {emoji} ${tp_price:.4f} ({tp_pct_str} = +${profit_usd:.2f})\n"
+
+                # SL с правильным знаком и убыток в $
+                sl_pct_str = self.format_price_change_pct(current_price, stop_loss, side)
+                sl_pct = abs((stop_loss - current_price) / current_price * 100)
+                loss_usd = invested * (sl_pct / 100) * Config.LEVERAGE
+
+                await self.send_telegram(
+                    f"🟢 ПОЗИЦИЯ ОТКРЫТА\n\n"
+                    f"💎 {symbol} | {side.upper()} | {Config.LEVERAGE}X\n"
+                    f"💰 Entry: ${current_price:.4f}\n"
+                    f"💵 Инвестировано: ${invested:.2f}\n\n"
+                    f"🎯 Targets:\n{targets_text}\n"
+                    f"🛡️ Stop Loss: ${stop_loss:.4f} ({sl_pct_str} = -${loss_usd:.2f})\n\n"
+                    f"🎲 Уверенность: {signal_data['confidence']:.0f}%\n"
+                    f"⏰ {datetime.now().strftime('%H:%M:%S')}"
+                )
+
+                logger.info(f"✅ Позиция {symbol} успешно открыта с защитой!")
+
+                # Добавляем монету в cooldown с указанием направления
+                self.add_symbol_to_cooldown(symbol, side)
+
+                return position
+
         except Exception as e:
             logger.error(f"❌ Ошибка открытия позиции: {e}")
             self.bot_errors_count += 1
@@ -1065,7 +1113,8 @@ class TradingBotV2:
                 f"{health_emoji} *ЗДОРОВЬЕ:*\n"
                 f"   Статус: {health_report['health_status']}\n"
                 f"   Ошибок: {health_report['total_errors']}\n"
-                f"   Healing попыток: {auto_healing.healing_attempts}"
+                f"   Healing попыток: {auto_healing.healing_attempts}\n\n"
+                f"🧯 *Анти-дубликаты:* предотвращено {self.duplicate_prevented}"
             )
             
         except Exception as e:

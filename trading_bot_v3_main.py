@@ -74,6 +74,11 @@ class TradingBotV2:
         logger.info("=" * 60)
         logger.info("🤖 ТОРГОВЫЙ БОТ V3.5 AUTONOMOUS ML/LLM - САМООБУЧАЮЩАЯСЯ СИСТЕМА")
         logger.info("=" * 60)
+
+        # Пер-символьные локи + метрика предотвращенных дублей
+        import asyncio as _asyncio
+        self._symbol_locks: Dict[str, _asyncio.Lock] = {}
+        self.duplicate_prevented: int = 0
         
         # Проверка конфигурации
         errors = Config.validate_config()
@@ -202,6 +207,15 @@ class TradingBotV2:
             logger.error(f"❌ Критическая ошибка запуска: {e}")
             await self.shutdown()
             raise
+
+    def _get_symbol_lock(self, symbol: str):
+        """Получить (или создать) лок для конкретного символа."""
+        import asyncio as _asyncio
+        lock = self._symbol_locks.get(symbol)
+        if lock is None:
+            lock = _asyncio.Lock()
+            self._symbol_locks[symbol] = lock
+        return lock
     
     async def trading_loop(self):
         """Основной торговый цикл"""
@@ -532,7 +546,22 @@ class TradingBotV2:
         Критически важно: SL ордер ОБЯЗАТЕЛЕН!
         """
         try:
-            logger.info(f"🚀 Открытие позиции: {symbol} {side.upper()}")
+            # Пер-символьный лок: не допускаем одновременных открытий по одному символу
+            async with self._get_symbol_lock(symbol):
+                # Повторная проверка перед открытием (в памяти)
+                if any(p['symbol'] == symbol for p in self.open_positions):
+                    self.duplicate_prevented += 1
+                    logger.warning(f"🧯 Дубликат предотвращен (в памяти): позиция по {symbol} уже открыта")
+                    return None
+
+                # И финальная проверка на бирже (межпроцессная защита)
+                real_positions = await exchange_manager.fetch_positions()
+                if any(p.get('symbol') == symbol and float(p.get('contracts', 0) or 0) > 0 for p in real_positions):
+                    self.duplicate_prevented += 1
+                    logger.warning(f"🧯 Дубликат предотвращен (биржа): активная позиция по {symbol} уже существует")
+                    return None
+
+                logger.info(f"🚀 Открытие позиции: {symbol} {side.upper()}")
             
             # 0. ПРОВЕРКА AI АГЕНТА
             balance = await exchange_manager.get_balance()
@@ -709,9 +738,9 @@ class TradingBotV2:
                 tp_amount = amount * tp_percentages[i]
                 
                 # Создаем ордер
-            tp_order = await exchange_manager.create_limit_order(
-                symbol=symbol,
-                side=close_side,
+                tp_order = await exchange_manager.create_limit_order(
+                    symbol=symbol,
+                    side=close_side,
                     amount=tp_amount,
                     price=tp_price
                 )
@@ -998,7 +1027,8 @@ class TradingBotV2:
                 f"━━━━━━━━━━━━━━━━━━━━━\n"
                 f"🧠 ML: {ml_short} | 🤖 LLM: {llm_short}\n"
                 f"🎯 WinRate: *{agent_report['win_rate']:.0%}* | PF: *{agent_report['profit_factor']:.2f}*\n"
-                f"🛡️ Здоровье: {health_emoji} | Ошибок: *{health_report['total_errors']}*"
+                f"🛡️ Здоровье: {health_emoji} | Ошибок: *{health_report['total_errors']}*\n\n"
+                f"🧯 Анти-дубликаты: предотвращено {self.duplicate_prevented}"
             )
             
             # Добавляем позиции если есть
