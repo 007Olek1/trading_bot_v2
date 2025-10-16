@@ -22,24 +22,24 @@ class VolatilityAnalyzer:
     async def analyze_symbol_volatility(self, symbol: str, exchange_manager) -> Dict[str, Any]:
         """Анализ волатильности конкретного символа"""
         try:
-            # ФИЛЬТР 2: Проверяем минимальный объем торгов
+            # ФИЛЬТР 2: Проверяем минимальный объем торгов (снижено для большего охвата)
             ticker = await exchange_manager.exchange.fetch_ticker(symbol)
-            if not ticker or ticker.get('quoteVolume', 0) < 1000000:  # Минимум $1M объем
+            if not ticker or ticker.get('quoteVolume', 0) < 500000:  # Минимум $500K объем (было $1M)
                 logger.debug(f"🚫 Исключен: {symbol} (низкий объем: ${ticker.get('quoteVolume', 0):,.0f})")
                 return {"volatility_score": 0, "trend_score": 0, "volume_score": 0}
             
-            # ФИЛЬТР 3: Проверяем минимальную цену (исключаем слишком дешевые монеты)
+            # ФИЛЬТР 3: Проверяем минимальную цену (снижено для большего охвата)
             current_price = ticker.get('last', 0)
-            if current_price < 0.01:  # Минимум $0.01
+            if current_price < 0.001:  # Минимум $0.001 (было $0.01)
                 logger.debug(f"🚫 Исключен: {symbol} (слишком дешевый: ${current_price:.6f})")
                 return {"volatility_score": 0, "trend_score": 0, "volume_score": 0}
             
-            # ФИЛЬТР 4: Проверяем спред (разница между bid/ask)
+            # ФИЛЬТР 4: Проверяем спред (более мягкий фильтр)
             bid = ticker.get('bid', 0)
             ask = ticker.get('ask', 0)
             if bid > 0 and ask > 0:
                 spread_pct = ((ask - bid) / bid) * 100
-                if spread_pct > 2.0:  # Спред больше 2%
+                if spread_pct > 5.0:  # Спред больше 5% (было 2%)
                     logger.debug(f"🚫 Исключен: {symbol} (высокий спред: {spread_pct:.2f}%)")
                     return {"volatility_score": 0, "trend_score": 0, "volume_score": 0}
             
@@ -221,25 +221,36 @@ class EnhancedSymbolSelector:
         self.last_analysis_time = None
         self.cached_symbols = []
     
-    async def get_volatile_symbols(self, exchange_manager, top_n: int = 50) -> List[Dict[str, Any]]:
-        """Получить волатильные символы с анализом"""
+    async def get_volatile_symbols(self, exchange_manager, top_n: int = 200) -> List[Dict[str, Any]]:
+        """Получить волатильные символы с анализом - ВСЕ доступные монеты"""
         try:
-            # Получаем базовый список топ символов
-            base_symbols = await exchange_manager.get_top_volume_symbols(top_n=200)
+            # Получаем ВСЕ доступные символы с биржи (не только топ 200)
+            logger.info("🔍 Получаем ВСЕ доступные символы с биржи...")
+            all_tickers = await exchange_manager.exchange.fetch_tickers()
             
-            if not base_symbols:
-                logger.warning("⚠️ Не удалось получить базовые символы")
+            # Фильтруем только USDT perpetual с минимальным объемом
+            usdt_perp_symbols = []
+            for symbol, ticker in all_tickers.items():
+                if (":USDT" in symbol and 
+                    ticker.get("quoteVolume", 0) > 500000 and  # Минимум $500K объем
+                    ticker.get("last", 0) > 0.001):  # Минимум $0.001 цена
+                    usdt_perp_symbols.append(symbol)
+            
+            logger.info(f"📊 Найдено {len(usdt_perp_symbols)} USDT perpetual символов с достаточной ликвидностью")
+            
+            if not usdt_perp_symbols:
+                logger.warning("⚠️ Не удалось получить символы с биржи")
                 return []
             
             # ФИЛЬТР 1: Исключаем малоликвидные и проблемные монеты
-            filtered_symbols = self._filter_problematic_symbols(base_symbols)
-            logger.info(f"🔍 После фильтрации: {len(filtered_symbols)} символов (было {len(base_symbols)})")
+            filtered_symbols = self._filter_problematic_symbols(usdt_perp_symbols)
+            logger.info(f"🔍 После фильтрации: {len(filtered_symbols)} символов (было {len(usdt_perp_symbols)})")
             
             logger.info(f"🔍 Анализирую волатильность {len(filtered_symbols)} символов...")
             
-            # Анализируем волатильность для каждого символа
+            # Анализируем волатильность для каждого символа (все доступные)
             analysis_tasks = []
-            for symbol in filtered_symbols[:150]:  # Увеличено для большего охвата
+            for symbol in filtered_symbols:  # Анализируем ВСЕ символы
                 task = self.volatility_analyzer.analyze_symbol_volatility(symbol, exchange_manager)
                 analysis_tasks.append(task)
             
@@ -289,33 +300,23 @@ class EnhancedSymbolSelector:
             return False
         
         time_diff = (datetime.now() - self.last_analysis_time).total_seconds()
-        return time_diff < 1800  # 30 минут
+        return time_diff < 3600  # 1 час (увеличено для большего количества монет)
     
     def _filter_problematic_symbols(self, symbols: List[str]) -> List[str]:
-        """Фильтрация малоликвидных и проблемных символов"""
+        """Фильтрация только действительно малоликвидных и проблемных символов"""
         try:
-            # Список исключений - малоликвидные монеты
+            # Минимальный список исключений - только действительно проблемные монеты
             excluded_symbols = {
-                # Малоликвидные токены
+                # Только самые малоликвидные токены (объем < $100K)
                 'XPIN/USDT:USDT', 'KGEN/USDT:USDT', 'TWT/USDT:USDT', 'IN/USDT:USDT',
+                
+                # Только самые проблемные мемкоины с экстремальной волатильностью
                 '1000PEPE/USDT:USDT', '1000SHIB/USDT:USDT', '1000FLOKI/USDT:USDT',
                 '1000BONK/USDT:USDT', '1000WIF/USDT:USDT', '1000MEME/USDT:USDT',
+                'BABYDOGE/USDT:USDT',
                 
-                # Проблемные символы с низкой ликвидностью
-                'GALA/USDT:USDT', 'SAND/USDT:USDT', 'MANA/USDT:USDT', 'AXS/USDT:USDT',
-                'IMX/USDT:USDT', 'APE/USDT:USDT', 'GMT/USDT:USDT', 'GAL/USDT:USDT',
-                
-                # Слишком волатильные мемкоины
-                'DOGE/USDT:USDT', 'SHIB/USDT:USDT', 'PEPE/USDT:USDT', 'FLOKI/USDT:USDT',
-                'BONK/USDT:USDT', 'WIF/USDT:USDT', 'MEME/USDT:USDT', 'BABYDOGE/USDT:USDT',
-                
-                # Проблемные DeFi токены
-                'CRV/USDT:USDT', 'SNX/USDT:USDT', 'COMP/USDT:USDT', 'MKR/USDT:USDT',
-                'AAVE/USDT:USDT', 'UNI/USDT:USDT', 'SUSHI/USDT:USDT', '1INCH/USDT:USDT',
-                
-                # Низколиквидные альткоины
-                'STORJ/USDT:USDT', 'ANKR/USDT:USDT', 'BAT/USDT:USDT', 'ZRX/USDT:USDT',
-                'KNC/USDT:USDT', 'REN/USDT:USDT', 'LRC/USDT:USDT', 'OMG/USDT:USDT'
+                # Только самые низколиквидные DeFi токены
+                'REN/USDT:USDT', 'OMG/USDT:USDT'
             }
             
             # Фильтруем символы
@@ -330,7 +331,7 @@ class EnhancedSymbolSelector:
                     filtered.append(symbol)
             
             logger.info(f"🚫 Исключено малоликвидных: {excluded_count}")
-            logger.info(f"✅ Прошло фильтрацию: {len(filtered)}")
+            logger.info(f"✅ Прошло фильтрацию: {len(filtered)} (включая популярные монеты)")
             
             return filtered
             
