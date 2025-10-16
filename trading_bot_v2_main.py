@@ -28,6 +28,7 @@ from bot_v2_signals import signal_analyzer
 from bot_v2_ai_agent import trading_bot_agent, health_monitor
 from bot_v2_auto_healing import auto_healing
 from bot_v2_volatility_analyzer import enhanced_symbol_selector
+from bot_v2_exchange import exchange_manager as ex_mgr_for_smoke
 
 # Создаем папку для логов если не существует
 os.makedirs(os.path.dirname(Config.LOG_FILE), exist_ok=True)
@@ -282,23 +283,23 @@ class TradingBotV2:
                 await self.emergency_shutdown(reason)
                 return
             
-            # 4. Получаем ВОЛАТИЛЬНЫЕ символы с анализом трендов - ВСЕГДА анализируем рынок!
-            logger.info("🚀 Получение волатильных монет с анализом трендов...")
+            # 4. Получаем ВОЛАТИЛЬНЫЕ символы с анализом трендов на основе ВСЕХ ликвидных пар
+            logger.info("🚀 Получение ликвидных и волатильных монет с анализом трендов...")
             
             # Проверяем кэш
             if enhanced_symbol_selector.is_cache_valid():
                 symbols = enhanced_symbol_selector.get_cached_symbols()
                 logger.info(f"📊 Использую кэшированные символы: {len(symbols)}")
             else:
-                # Получаем свежий анализ волатильности
+                # Получаем свежий анализ волатильности из полного пула ликвидных символов
                 volatile_symbols_data = await enhanced_symbol_selector.get_volatile_symbols(
-                    exchange_manager, top_n=100
+                    exchange_manager, top_n=300
                 )
                 symbols = [data['symbol'] for data in volatile_symbols_data]
                 
                 if not symbols:
-                    logger.warning("⚠️ Не удалось получить волатильные символы, используем базовые")
-                    symbols = await exchange_manager.get_top_volume_symbols(top_n=50)
+                    logger.warning("⚠️ Не удалось получить волатильные символы, пробуем взять все ликвидные пары")
+                    symbols = await exchange_manager.get_all_liquid_symbols()
             
             if not symbols:
                 logger.warning("⚠️ Не удалось получить символы")
@@ -1473,5 +1474,19 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # По умолчанию запускаем бота; установить переменную окружения SMOKE_LIQUID=1 для smoke-теста
+    if os.getenv("SMOKE_LIQUID", "0") == "1":
+        async def _smoke():
+            try:
+                await ex_mgr_for_smoke.connect()
+                symbols = await ex_mgr_for_smoke.get_all_liquid_symbols()
+                print(f"SMOKE: найдено ликвидных пар: {len(symbols)}")
+                print("Примеры:", symbols[:15])
+            except Exception as e:
+                print("SMOKE ERROR:", e)
+            finally:
+                await ex_mgr_for_smoke.disconnect()
+        asyncio.run(_smoke())
+    else:
+        asyncio.run(main())
 

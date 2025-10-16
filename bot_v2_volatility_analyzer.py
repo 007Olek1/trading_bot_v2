@@ -8,6 +8,7 @@ import logging
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime, timedelta
 import asyncio
+from bot_v2_config import Config
 
 logger = logging.getLogger(__name__)
 
@@ -24,13 +25,15 @@ class VolatilityAnalyzer:
         try:
             # ФИЛЬТР 2: Проверяем минимальный объем торгов
             ticker = await exchange_manager.exchange.fetch_ticker(symbol)
-            if not ticker or ticker.get('quoteVolume', 0) < 1000000:  # Минимум $1M объем
+            min_quote_volume = getattr(Config, 'LIQUIDITY_MIN_QUOTE_VOLUME_USD', 1_000_000)
+            if not ticker or ticker.get('quoteVolume', 0) < min_quote_volume:
                 logger.debug(f"🚫 Исключен: {symbol} (низкий объем: ${ticker.get('quoteVolume', 0):,.0f})")
                 return {"volatility_score": 0, "trend_score": 0, "volume_score": 0}
             
             # ФИЛЬТР 3: Проверяем минимальную цену (исключаем слишком дешевые монеты)
             current_price = ticker.get('last', 0)
-            if current_price < 0.01:  # Минимум $0.01
+            min_price = getattr(Config, 'LIQUIDITY_MIN_PRICE_USD', 0.01)
+            if current_price < min_price:
                 logger.debug(f"🚫 Исключен: {symbol} (слишком дешевый: ${current_price:.6f})")
                 return {"volatility_score": 0, "trend_score": 0, "volume_score": 0}
             
@@ -39,7 +42,8 @@ class VolatilityAnalyzer:
             ask = ticker.get('ask', 0)
             if bid > 0 and ask > 0:
                 spread_pct = ((ask - bid) / bid) * 100
-                if spread_pct > 2.0:  # Спред больше 2%
+                max_spread = getattr(Config, 'LIQUIDITY_MAX_SPREAD_PERCENT', 2.0)
+                if spread_pct > max_spread:
                     logger.debug(f"🚫 Исключен: {symbol} (высокий спред: {spread_pct:.2f}%)")
                     return {"volatility_score": 0, "trend_score": 0, "volume_score": 0}
             
@@ -224,14 +228,14 @@ class EnhancedSymbolSelector:
     async def get_volatile_symbols(self, exchange_manager, top_n: int = 50) -> List[Dict[str, Any]]:
         """Получить волатильные символы с анализом"""
         try:
-            # Получаем базовый список топ символов
-            base_symbols = await exchange_manager.get_top_volume_symbols(top_n=200)
+            # Получаем динамически ВСЕ ликвидные символы (а не топ-N фиксированный)
+            base_symbols = await exchange_manager.get_all_liquid_symbols()
             
             if not base_symbols:
                 logger.warning("⚠️ Не удалось получить базовые символы")
                 return []
             
-            # ФИЛЬТР 1: Исключаем малоликвидные и проблемные монеты
+            # ФИЛЬТР 1: Исключаем проблемные монеты (чёрный список)
             filtered_symbols = self._filter_problematic_symbols(base_symbols)
             logger.info(f"🔍 После фильтрации: {len(filtered_symbols)} символов (было {len(base_symbols)})")
             
@@ -239,7 +243,7 @@ class EnhancedSymbolSelector:
             
             # Анализируем волатильность для каждого символа
             analysis_tasks = []
-            for symbol in filtered_symbols[:150]:  # Увеличено для большего охвата
+            for symbol in filtered_symbols[:300]:  # Шире охват, но с ограничением
                 task = self.volatility_analyzer.analyze_symbol_volatility(symbol, exchange_manager)
                 analysis_tasks.append(task)
             

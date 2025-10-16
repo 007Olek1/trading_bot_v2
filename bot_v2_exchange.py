@@ -316,6 +316,68 @@ class ExchangeManager:
             logger.error(f"❌ Ошибка получения OHLCV {symbol}: {e}")
             return None
     
+    async def get_all_liquid_symbols(self) -> List[str]:
+        """Получить ВСЕ доступные ликвидные USDT-пары (swap) с фильтрами ликвидности.
+
+        Критерии:
+        - Символ содержит ":USDT" (перпетуальные свопы в Bybit)
+        - Суточный оборот в котируемой валюте >= Config.LIQUIDITY_MIN_QUOTE_VOLUME_USD
+        - Текущая цена >= Config.LIQUIDITY_MIN_PRICE_USD
+        - Спред (ask-bid)/bid*100 <= Config.LIQUIDITY_MAX_SPREAD_PERCENT (если bid/ask доступны)
+        Возвращает список символов, отсортированный по обороту (убывание).
+        """
+        try:
+            tickers = await self.exchange.fetch_tickers()
+
+            liquid: List[tuple[str, float]] = []
+            for symbol, ticker in tickers.items():
+                try:
+                    # Только USDT perpetual
+                    if ":USDT" not in symbol:
+                        continue
+
+                    # Оборот в квотируемой валюте (USDT)
+                    quote_volume = float(ticker.get("quoteVolume", 0) or 0)
+                    if quote_volume == 0:
+                        info = ticker.get("info", {}) or {}
+                        # Популярные поля в Bybit/ccxt
+                        for key in ("turnover24h", "turnover_24h", "turnover", "quoteValue"):
+                            if key in info:
+                                try:
+                                    quote_volume = float(info[key])
+                                    break
+                                except Exception:
+                                    continue
+
+                    # Цена, спред
+                    last_price = float(ticker.get("last", 0) or 0)
+                    bid = float(ticker.get("bid", 0) or 0)
+                    ask = float(ticker.get("ask", 0) or 0)
+
+                    # Фильтры ликвидности
+                    if quote_volume < Config.LIQUIDITY_MIN_QUOTE_VOLUME_USD:
+                        continue
+                    if last_price < Config.LIQUIDITY_MIN_PRICE_USD:
+                        continue
+                    if bid > 0 and ask > 0:
+                        spread_pct = ((ask - bid) / bid) * 100.0
+                        if spread_pct > Config.LIQUIDITY_MAX_SPREAD_PERCENT:
+                            continue
+
+                    liquid.append((symbol, quote_volume))
+                except Exception:
+                    # Игнорируем отдельные ошибки по тикерам
+                    continue
+
+            # Сортируем по обороту по убыванию для стабильного порядка
+            liquid.sort(key=lambda x: x[1], reverse=True)
+            symbols = [s for s, _ in liquid]
+            logger.info(f"💧 Ликвидные символы (USDT swap): {len(symbols)}")
+            return symbols
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения ликвидных символов: {e}")
+            return []
+
     async def get_top_volume_symbols(self, top_n: int = 50) -> List[str]:
         """Получить топ символы по объему"""
         try:
