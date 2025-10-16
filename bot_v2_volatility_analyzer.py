@@ -221,25 +221,32 @@ class EnhancedSymbolSelector:
         self.last_analysis_time = None
         self.cached_symbols = []
     
-    async def get_volatile_symbols(self, exchange_manager, top_n: int = 50) -> List[Dict[str, Any]]:
-        """Получить волатильные символы с анализом"""
+    async def get_volatile_symbols(self, exchange_manager, top_n: int = 50, min_volume_usd: float = 1000000) -> List[Dict[str, Any]]:
+        """Получить волатильные символы с анализом из ВСЕХ доступных ликвидных монет
+        
+        Args:
+            exchange_manager: Менеджер биржи
+            top_n: Количество символов для возврата
+            min_volume_usd: Минимальный объем торгов в USD за 24ч (фильтр ликвидности)
+        """
         try:
-            # Получаем базовый список топ символов
-            base_symbols = await exchange_manager.get_top_volume_symbols(top_n=200)
+            # Получаем ВСЕ ликвидные символы (не только топ 200)
+            # top_n=0 означает "все доступные ликвидные монеты"
+            base_symbols = await exchange_manager.get_top_volume_symbols(
+                top_n=0,  # Все доступные
+                min_volume_usd=min_volume_usd  # Только ликвидные (> $1M объем)
+            )
             
             if not base_symbols:
                 logger.warning("⚠️ Не удалось получить базовые символы")
                 return []
             
-            # ФИЛЬТР 1: Исключаем малоликвидные и проблемные монеты
-            filtered_symbols = self._filter_problematic_symbols(base_symbols)
-            logger.info(f"🔍 После фильтрации: {len(filtered_symbols)} символов (было {len(base_symbols)})")
+            logger.info(f"🔍 Получено {len(base_symbols)} ликвидных символов для анализа")
+            logger.info(f"🔍 Анализирую волатильность всех доступных монет...")
             
-            logger.info(f"🔍 Анализирую волатильность {len(filtered_symbols)} символов...")
-            
-            # Анализируем волатильность для каждого символа
+            # Анализируем волатильность для ВСЕХ ликвидных символов
             analysis_tasks = []
-            for symbol in filtered_symbols[:150]:  # Увеличено для большего охвата
+            for symbol in base_symbols:  # Анализируем все, без ограничений
                 task = self.volatility_analyzer.analyze_symbol_volatility(symbol, exchange_manager)
                 analysis_tasks.append(task)
             
@@ -258,7 +265,7 @@ class EnhancedSymbolSelector:
             # Берем топ N
             top_volatile = valid_results[:top_n]
             
-            logger.info(f"📊 Найдено {len(top_volatile)} волатильных символов")
+            logger.info(f"📊 Найдено {len(top_volatile)} волатильных символов из {len(valid_results)} проанализированных")
             
             # Логируем топ 10
             for i, symbol_data in enumerate(top_volatile[:10]):
@@ -292,51 +299,14 @@ class EnhancedSymbolSelector:
         return time_diff < 1800  # 30 минут
     
     def _filter_problematic_symbols(self, symbols: List[str]) -> List[str]:
-        """Фильтрация малоликвидных и проблемных символов"""
-        try:
-            # Список исключений - малоликвидные монеты
-            excluded_symbols = {
-                # Малоликвидные токены
-                'XPIN/USDT:USDT', 'KGEN/USDT:USDT', 'TWT/USDT:USDT', 'IN/USDT:USDT',
-                '1000PEPE/USDT:USDT', '1000SHIB/USDT:USDT', '1000FLOKI/USDT:USDT',
-                '1000BONK/USDT:USDT', '1000WIF/USDT:USDT', '1000MEME/USDT:USDT',
-                
-                # Проблемные символы с низкой ликвидностью
-                'GALA/USDT:USDT', 'SAND/USDT:USDT', 'MANA/USDT:USDT', 'AXS/USDT:USDT',
-                'IMX/USDT:USDT', 'APE/USDT:USDT', 'GMT/USDT:USDT', 'GAL/USDT:USDT',
-                
-                # Слишком волатильные мемкоины
-                'DOGE/USDT:USDT', 'SHIB/USDT:USDT', 'PEPE/USDT:USDT', 'FLOKI/USDT:USDT',
-                'BONK/USDT:USDT', 'WIF/USDT:USDT', 'MEME/USDT:USDT', 'BABYDOGE/USDT:USDT',
-                
-                # Проблемные DeFi токены
-                'CRV/USDT:USDT', 'SNX/USDT:USDT', 'COMP/USDT:USDT', 'MKR/USDT:USDT',
-                'AAVE/USDT:USDT', 'UNI/USDT:USDT', 'SUSHI/USDT:USDT', '1INCH/USDT:USDT',
-                
-                # Низколиквидные альткоины
-                'STORJ/USDT:USDT', 'ANKR/USDT:USDT', 'BAT/USDT:USDT', 'ZRX/USDT:USDT',
-                'KNC/USDT:USDT', 'REN/USDT:USDT', 'LRC/USDT:USDT', 'OMG/USDT:USDT'
-            }
-            
-            # Фильтруем символы
-            filtered = []
-            excluded_count = 0
-            
-            for symbol in symbols:
-                if symbol in excluded_symbols:
-                    excluded_count += 1
-                    logger.debug(f"🚫 Исключен: {symbol} (малоликвидный)")
-                else:
-                    filtered.append(symbol)
-            
-            logger.info(f"🚫 Исключено малоликвидных: {excluded_count}")
-            logger.info(f"✅ Прошло фильтрацию: {len(filtered)}")
-            
-            return filtered
-            
-        except Exception as e:
-            logger.error(f"❌ Ошибка фильтрации символов: {e}")
-            return symbols  # Возвращаем исходный список при ошибке
+        """УДАЛЕНО: Фильтрация теперь происходит автоматически по объему торгов
+        
+        Этот метод больше не используется, т.к. фильтрация малоликвидных монет
+        происходит автоматически в get_top_volume_symbols() на основе реального
+        объема торгов (min_volume_usd)
+        """
+        logger.info(f"✅ Все символы уже отфильтрованы по ликвидности: {len(symbols)}")
+        return symbols
 
 
 # Глобальные экземпляры
