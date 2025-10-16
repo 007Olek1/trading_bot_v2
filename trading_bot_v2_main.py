@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
 import pandas as pd
 import pytz
+import json
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -28,6 +29,7 @@ from bot_v2_signals import signal_analyzer
 from bot_v2_ai_agent import trading_bot_agent, health_monitor
 from bot_v2_auto_healing import auto_healing
 from bot_v2_volatility_analyzer import enhanced_symbol_selector
+from bot_v2_duplicate_prevention import duplicate_prevention
 
 # Создаем папку для логов если не существует
 os.makedirs(os.path.dirname(Config.LOG_FILE), exist_ok=True)
@@ -83,6 +85,9 @@ class TradingBotV2:
         logger.info("=" * 60)
         logger.info("🤖 ТОРГОВЫЙ БОТ V2.0 ИНИЦИАЛИЗИРОВАН")
         logger.info("=" * 60)
+        
+        # Загружаем сохраненное состояние cooldown
+        self.load_cooldown_state()
         
         # Проверка конфигурации
         errors = Config.validate_config()
@@ -146,6 +151,9 @@ class TradingBotV2:
         if hours_passed >= self.cooldown_hours:
             # Cooldown истёк, удаляем из словаря
             del self.symbol_cooldown[symbol]
+            if symbol in self.symbol_last_side:
+                del self.symbol_last_side[symbol]
+            self.save_cooldown_state()
             return False, 0.0
         
         hours_remaining = self.cooldown_hours - hours_passed
@@ -156,6 +164,47 @@ class TradingBotV2:
         self.symbol_cooldown[symbol] = datetime.now()
         self.symbol_last_side[symbol] = side.lower()
         logger.info(f"⏰ {symbol} {side.upper()} добавлена в cooldown на {self.cooldown_hours} часов")
+        self.save_cooldown_state()
+    
+    def save_cooldown_state(self):
+        """Сохраняет состояние cooldown в файл"""
+        try:
+            cooldown_data = {
+                'cooldowns': {
+                    symbol: timestamp.isoformat() 
+                    for symbol, timestamp in self.symbol_cooldown.items()
+                },
+                'last_sides': self.symbol_last_side,
+                'saved_at': datetime.now().isoformat()
+            }
+            
+            with open('cooldown_state.json', 'w') as f:
+                json.dump(cooldown_data, f, indent=2)
+            
+            logger.debug(f"💾 Cooldown состояние сохранено для {len(self.symbol_cooldown)} символов")
+        except Exception as e:
+            logger.error(f"❌ Ошибка сохранения cooldown состояния: {e}")
+    
+    def load_cooldown_state(self):
+        """Загружает состояние cooldown из файла"""
+        try:
+            if os.path.exists('cooldown_state.json'):
+                with open('cooldown_state.json', 'r') as f:
+                    data = json.load(f)
+                
+                # Восстанавливаем cooldowns
+                for symbol, timestamp_str in data.get('cooldowns', {}).items():
+                    timestamp = datetime.fromisoformat(timestamp_str)
+                    # Проверяем, не истек ли cooldown
+                    if datetime.now() - timestamp < timedelta(hours=self.cooldown_hours):
+                        self.symbol_cooldown[symbol] = timestamp
+                
+                # Восстанавливаем последние направления
+                self.symbol_last_side = data.get('last_sides', {})
+                
+                logger.info(f"📂 Загружено cooldown состояние для {len(self.symbol_cooldown)} символов")
+        except Exception as e:
+            logger.error(f"❌ Ошибка загрузки cooldown состояния: {e}")
     
     async def start(self):
         """Запуск бота"""
@@ -191,6 +240,7 @@ class TradingBotV2:
             self.telegram_app.add_handler(CommandHandler("stop", self.cmd_stop))
             self.telegram_app.add_handler(CommandHandler("pause", self.cmd_pause))
             self.telegram_app.add_handler(CommandHandler("resume", self.cmd_resume))
+            self.telegram_app.add_handler(CommandHandler("cooldowns", self.cmd_cooldowns))
             
             # Запуск Telegram в фоне (без polling - только уведомления)
             await self.telegram_app.initialize()
@@ -270,6 +320,10 @@ class TradingBotV2:
             # 2. Синхронизация позиций
             await self.sync_positions_from_exchange()
             
+            # Синхронизируем duplicate prevention
+            exchange_positions = await exchange_manager.fetch_positions()
+            duplicate_prevention.sync_with_exchange_positions(exchange_positions)
+            
             # 3. Проверка аварийных условий
             should_stop, reason = await emergency_stop.check_emergency_conditions(
                 risk_manager,
@@ -346,20 +400,23 @@ class TradingBotV2:
                 if len(self.open_positions) >= Config.MAX_POSITIONS:
                     break
                 
-                # Пропускаем если уже есть позиция
-                if any(p['symbol'] == symbol for p in self.open_positions):
-                    continue
-                
-                # ПРОВЕРКА COOLDOWN - предотвращаем повторные входы
-                is_cooldown, hours_remaining = self.is_symbol_on_cooldown(symbol)
-                if is_cooldown:
-                    logger.debug(f"⏰ {symbol} на cooldown (осталось {hours_remaining:.1f}ч)")
+                # Используем duplicate prevention для комплексной проверки
+                can_open, reason = await duplicate_prevention.can_open_position(symbol, self.open_positions)
+                if not can_open:
+                    logger.debug(f"🚫 {symbol}: {reason}")
                     continue
                 
                 # Анализ
                 signal_result = await self.analyze_symbol(symbol)
                 
                 if signal_result and signal_result.get('signal'):
+                    # ДОПОЛНИТЕЛЬНАЯ ПРОВЕРКА перед открытием позиции
+                    # (на случай если позиция была открыта между проверками)
+                    await self.sync_positions_from_exchange()
+                    if any(p['symbol'] == symbol for p in self.open_positions):
+                        logger.warning(f"⚠️ {symbol} получил позицию во время анализа, отменяем открытие")
+                        continue
+                    
                     # Пытаемся открыть сделку
                     position = await self.open_position(
                         symbol=symbol,
@@ -502,6 +559,14 @@ class TradingBotV2:
         """
         try:
             logger.info(f"🚀 Открытие позиции: {symbol} {side.upper()}")
+            
+            # КРИТИЧЕСКАЯ ПРОВЕРКА с duplicate prevention
+            # (последняя проверка перед открытием)
+            await self.sync_positions_from_exchange()
+            can_open, reason = await duplicate_prevention.can_open_position(symbol, self.open_positions)
+            if not can_open:
+                logger.warning(f"⚠️ ДУБЛИКАТ ПРЕДОТВРАЩЕН: {symbol} - {reason}")
+                return None
             
             # 0. ПРОВЕРКА AI АГЕНТА
             balance = await exchange_manager.get_balance()
@@ -762,7 +827,10 @@ class TradingBotV2:
             
             logger.info(f"✅ Позиция {symbol} успешно открыта с защитой!")
             
-            # Добавляем монету в cooldown с указанием направления
+            # Регистрируем в duplicate prevention
+            await duplicate_prevention.register_position_opening(symbol, side)
+            
+            # Также сохраняем в старой системе для обратной совместимости
             self.add_symbol_to_cooldown(symbol, side)
             
             return position
@@ -785,6 +853,15 @@ class TradingBotV2:
                 size = float(ex_pos.get('contracts', 0))
                 
                 if size > 0:
+                    # КРИТИЧНО: Добавляем символ в cooldown при синхронизации!
+                    side = ex_pos.get('side', 'unknown')
+                    if symbol not in self.symbol_cooldown:
+                        # Добавляем в cooldown с текущим временем минус 1 час
+                        # (чтобы не блокировать на полные 6 часов при перезапуске)
+                        self.symbol_cooldown[symbol] = datetime.now() - timedelta(hours=1)
+                        self.symbol_last_side[symbol] = side.lower()
+                        logger.info(f"⏰ {symbol} добавлена в cooldown при синхронизации (позиция {side})")
+                    
                     # КРИТИЧНО: Проверяем SL НА ПОЗИЦИИ, а не в ордерах!
                     # Bybit использует trading-stop API, который устанавливает SL на позицию
                     stop_loss_price = ex_pos.get('stopLoss') or ex_pos.get('info', {}).get('stopLoss')
@@ -816,7 +893,7 @@ class TradingBotV2:
                     
                     position = {
                         "symbol": symbol,
-                        "side": ex_pos.get('side'),
+                        "side": side,
                         "entry_price": float(ex_pos.get('entryPrice', 0)),
                         "amount": size,
                         "sl_order_id": sl_order_id,  # Фиктивный ID на основе stopLoss позиции
@@ -876,6 +953,9 @@ class TradingBotV2:
             
             # 3. TRAILING STOP LOSS - перемещаем SL за прибылью
             await self.update_trailing_stop_loss()
+            
+            # 4. Периодическая очистка duplicate prevention
+            duplicate_prevention.cleanup_old_entries()
             
         except Exception as e:
             logger.error(f"❌ Ошибка health check: {e}")
@@ -1263,7 +1343,27 @@ class TradingBotV2:
             # 8. Удаляем из списка открытых
             self.open_positions = [p for p in self.open_positions if p['symbol'] != symbol]
             
-            # 9. Уведомление
+            # 9. Регистрируем закрытие в duplicate prevention
+            await duplicate_prevention.register_position_closing(symbol, side, pnl)
+            
+            # Также обновляем старую систему cooldown для обратной совместимости
+            if symbol in self.symbol_cooldown:
+                del self.symbol_cooldown[symbol]
+            if symbol in self.symbol_last_side:
+                del self.symbol_last_side[symbol]
+            
+            # Устанавливаем новый cooldown после закрытия
+            if pnl < 0:
+                self.symbol_cooldown[symbol] = datetime.now()
+                logger.info(f"⏰ {symbol} добавлена в cooldown после убытка на {self.cooldown_hours * 1.5} часов")
+            else:
+                self.symbol_cooldown[symbol] = datetime.now()
+                logger.info(f"⏰ {symbol} добавлена в cooldown после прибыли на {self.cooldown_hours} часов")
+            
+            self.symbol_last_side[symbol] = side.lower()
+            self.save_cooldown_state()
+            
+            # 10. Уведомление
             emoji = "🟢" if pnl > 0 else "🔴"
             await self.send_telegram(
                 f"{emoji} ПОЗИЦИЯ ЗАКРЫТА\n\n"
@@ -1311,7 +1411,8 @@ class TradingBotV2:
             "*📊 Информация:*\n"
             "/status - краткий статус\n"
             "/positions - детали позиций\n"
-            "/history - история сделок\n\n"
+            "/history - история сделок\n"
+            "/cooldowns - монеты в cooldown\n\n"
             "*🎮 Управление:*\n"
             "/pause - пауза бота\n"
             "/resume - возобновить\n"
@@ -1455,6 +1556,47 @@ class TradingBotV2:
         """Команда /stop"""
         await update.message.reply_text("🛑 Останавливаю бота...")
         await self.shutdown()
+    
+    async def cmd_cooldowns(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда /cooldowns - показать статус cooldown для монет"""
+        try:
+            # Получаем статус от duplicate prevention
+            dp_status = duplicate_prevention.get_status_report()
+            
+            msg = "⏰ *DUPLICATE PREVENTION СТАТУС*\n\n"
+            
+            # Активные позиции
+            if dp_status['active_positions']:
+                msg += "*🟢 Активные позиции:*\n"
+                for symbol in dp_status['active_positions']:
+                    msg += f"  • {symbol}\n"
+                msg += "\n"
+            
+            # Cooldowns
+            if dp_status['cooldowns']:
+                msg += "*🔒 В cooldown:*\n"
+                for cooldown_info in sorted(dp_status['cooldowns'], key=lambda x: x['hours_remaining']):
+                    symbol = cooldown_info['symbol']
+                    hours = cooldown_info['hours_remaining']
+                    side = cooldown_info['last_side']
+                    
+                    if hours > 0:
+                        msg += f"  • {symbol} ({side.upper()})\n"
+                        msg += f"    Осталось: {hours:.1f} часов\n"
+                msg += "\n"
+            
+            msg += f"📊 *Статистика:*\n"
+            msg += f"  • Активных: {dp_status['total_active']}\n"
+            msg += f"  • В cooldown: {dp_status['total_cooldowns']}\n"
+            msg += f"  • Защищено монет: {dp_status['total_active'] + dp_status['total_cooldowns']}"
+            
+            if not dp_status['active_positions'] and not dp_status['cooldowns']:
+                msg = "✅ Нет активных позиций или cooldown"
+            
+            await update.message.reply_text(msg, parse_mode='Markdown')
+            
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка: {e}")
 
 
 async def main():
