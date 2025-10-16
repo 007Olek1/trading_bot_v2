@@ -31,6 +31,7 @@ from bot_v2_candle_analyzer import candle_analyzer
 from bot_v2_ai_agent import trading_bot_agent, health_monitor
 from bot_v2_auto_healing import auto_healing
 from bot_v2_super_ai_agent import super_ai_agent
+from bot_v2_volatility_analyzer import EnhancedSymbolSelector
 # ML/LLM агенты V3.5
 from bot_v3_ml_engine import ml_engine
 from bot_v3_llm_agent import llm_agent
@@ -278,20 +279,23 @@ class TradingBotV2:
             await self.send_telegram(
                 f"🔄 *ТОРГОВЫЙ ЦИКЛ*\n\n"
                 f"⏰ {current_time}\n"
-                f"📊 ТОП 100 популярных монет\n"
+                f"📊 Все доступные ликвидные монеты\n"
                 f"🔍 Начинаю анализ...\n"
                 f"⏱️ ~3 минуты"
             )
             
-            # Используем фиксированный список из конфига
-            symbols = Config.TOP_100_SYMBOLS
+            # ДИНАМИЧЕСКОЕ получение ВСЕХ доступных ликвидных монет
+            symbols = await exchange_manager.get_top_volume_symbols(
+                top_n=0,  # Все доступные
+                min_volume_usd=Config.MIN_VOLUME_USD_24H
+            )
             
             if not symbols:
-                logger.warning("⚠️ Список символов пуст")
-                await self.send_telegram(f"⚠️ Ошибка: список монет пуст")
+                logger.warning("⚠️ Не удалось получить символы")
+                await self.send_telegram(f"⚠️ Ошибка: не удалось получить список монет")
                 return
             
-            logger.info(f"🔍 Анализ {len(symbols)} символов...")
+            logger.info(f"🔍 Анализ {len(symbols)} доступных ликвидных символов...")
             
             # 8. КРИТИЧНО: Собираем ВСЕ сильные сигналы (≥85%) для AI анализа
             all_signals = []
@@ -709,9 +713,9 @@ class TradingBotV2:
                 tp_amount = amount * tp_percentages[i]
                 
                 # Создаем ордер
-            tp_order = await exchange_manager.create_limit_order(
-                symbol=symbol,
-                side=close_side,
+                tp_order = await exchange_manager.create_limit_order(
+                    symbol=symbol,
+                    side=close_side,
                     amount=tp_amount,
                     price=tp_price
                 )
@@ -869,10 +873,10 @@ class TradingBotV2:
                 
                 # Если SL отсутствует или равен 0
                 if not stop_loss or stop_loss == "" or stop_loss == "0":
-                        logger.critical(
+                    logger.critical(
                         f"🚨 {symbol}: ПОЗИЦИЯ БЕЗ SL (реальная проверка биржи)! "
-                            f"Auto-Healing активирован!"
-                        )
+                        f"Auto-Healing активирован!"
+                    )
                     health_monitor.record_error("missing_sl_order", symbol)
                     
                     # Создаем SL немедленно

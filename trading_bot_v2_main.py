@@ -282,23 +282,29 @@ class TradingBotV2:
                 await self.emergency_shutdown(reason)
                 return
             
-            # 4. Получаем ВОЛАТИЛЬНЫЕ символы с анализом трендов - ВСЕГДА анализируем рынок!
-            logger.info("🚀 Получение волатильных монет с анализом трендов...")
+            # 4. Получаем ВОЛАТИЛЬНЫЕ символы с анализом трендов из ВСЕХ доступных монет!
+            logger.info("🚀 Получение волатильных монет из всех доступных ликвидных пар...")
             
             # Проверяем кэш
             if enhanced_symbol_selector.is_cache_valid():
                 symbols = enhanced_symbol_selector.get_cached_symbols()
                 logger.info(f"📊 Использую кэшированные символы: {len(symbols)}")
             else:
-                # Получаем свежий анализ волатильности
+                # Получаем свежий анализ волатильности из ВСЕХ доступных монет
+                # min_volume_usd - фильтр ликвидности, исключаем малоликвидные
                 volatile_symbols_data = await enhanced_symbol_selector.get_volatile_symbols(
-                    exchange_manager, top_n=100
+                    exchange_manager, 
+                    top_n=100,  # Берем топ-100 самых волатильных
+                    min_volume_usd=Config.MIN_VOLUME_USD_24H
                 )
                 symbols = [data['symbol'] for data in volatile_symbols_data]
                 
                 if not symbols:
                     logger.warning("⚠️ Не удалось получить волатильные символы, используем базовые")
-                    symbols = await exchange_manager.get_top_volume_symbols(top_n=50)
+                    symbols = await exchange_manager.get_top_volume_symbols(
+                        top_n=50, 
+                        min_volume_usd=Config.MIN_VOLUME_USD_24H
+                    )
             
             if not symbols:
                 logger.warning("⚠️ Не удалось получить символы")

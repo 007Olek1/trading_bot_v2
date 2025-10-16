@@ -316,16 +316,24 @@ class ExchangeManager:
             logger.error(f"❌ Ошибка получения OHLCV {symbol}: {e}")
             return None
     
-    async def get_top_volume_symbols(self, top_n: int = 50) -> List[str]:
-        """Получить топ символы по объему"""
+    async def get_top_volume_symbols(self, top_n: int = 50, min_volume_usd: float = 1000000) -> List[str]:
+        """Получить все ликвидные символы по объему
+        
+        Args:
+            top_n: Максимальное количество символов (0 = все ликвидные)
+            min_volume_usd: Минимальный объем торгов в USD за 24ч (по умолчанию $1M)
+        """
         try:
             tickers = await self.exchange.fetch_tickers()
             
-            # Фильтр: только USDT perpetual
-            usdt_perp = {
-                symbol: ticker for symbol, ticker in tickers.items()
-                if ":USDT" in symbol and ticker.get("quoteVolume", 0) > 0
-            }
+            # Фильтр: только USDT perpetual с достаточным объемом
+            usdt_perp = {}
+            for symbol, ticker in tickers.items():
+                if ":USDT" in symbol:
+                    volume = ticker.get("quoteVolume", 0)
+                    # Фильтруем по минимальному объему (защита от малоликвидных)
+                    if volume >= min_volume_usd:
+                        usdt_perp[symbol] = ticker
             
             # Сортировка по объему
             sorted_symbols = sorted(
@@ -334,10 +342,14 @@ class ExchangeManager:
                 reverse=True
             )
             
-            # Топ N
-            top_symbols = [symbol for symbol, _ in sorted_symbols[:top_n]]
+            # Если top_n == 0, возвращаем все ликвидные символы
+            if top_n == 0:
+                top_symbols = [symbol for symbol, _ in sorted_symbols]
+                logger.info(f"📊 Все {len(top_symbols)} ликвидных символов (мин. объем ${min_volume_usd:,.0f})")
+            else:
+                top_symbols = [symbol for symbol, _ in sorted_symbols[:top_n]]
+                logger.info(f"📊 Топ {len(top_symbols)} символов по объему (мин. объем ${min_volume_usd:,.0f})")
             
-            logger.info(f"📊 Топ {len(top_symbols)} символов по объему")
             return top_symbols
             
         except Exception as e:
