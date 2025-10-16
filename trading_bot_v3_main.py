@@ -270,21 +270,34 @@ class TradingBotV2:
                     await self.pause_bot()
                 return
             
-            # 7. Используем ФИКСИРОВАННЫЙ список ТОП 100 популярных монет
-            logger.info("📊 Используем ТОП 100 популярных монет...")
-            
+            # 7. Формируем торговую вселенную символов
+            logger.info("📊 Формируем торговую вселенную символов...")
+
             # Уведомление о начале анализа
             current_time = datetime.now().strftime('%H:%M:%S')
             await self.send_telegram(
                 f"🔄 *ТОРГОВЫЙ ЦИКЛ*\n\n"
                 f"⏰ {current_time}\n"
-                f"📊 ТОП 100 популярных монет\n"
+                f"📊 Формирую торговую вселенную монет\n"
                 f"🔍 Начинаю анализ...\n"
                 f"⏱️ ~3 минуты"
             )
-            
-            # Используем фиксированный список из конфига
-            symbols = Config.TOP_100_SYMBOLS
+
+            # Используем динамический выбор при включенной опции
+            if Config.USE_DYNAMIC_SYMBOL_SELECTION:
+                base = await exchange_manager.get_top_volume_symbols(top_n=300)
+                if not base:
+                    base = await exchange_manager.get_all_tradeable_usdt_perp_symbols()
+
+                # Применяем продвинутый селектор волатильности
+                from bot_v2_volatility_analyzer import enhanced_symbol_selector
+                volatile_symbols_data = await enhanced_symbol_selector.get_volatile_symbols(
+                    exchange_manager,
+                    top_n=min(Config.DYNAMIC_SYMBOLS_TOP_N, 150)
+                )
+                symbols = [d['symbol'] for d in volatile_symbols_data]
+            else:
+                symbols = Config.TOP_100_SYMBOLS
             
             if not symbols:
                 logger.warning("⚠️ Список символов пуст")

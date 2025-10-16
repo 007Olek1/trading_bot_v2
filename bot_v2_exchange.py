@@ -56,6 +56,35 @@ class ExchangeManager:
         except Exception as e:
             logger.error(f"❌ Ошибка получения баланса: {e}")
             return None
+
+    async def get_all_tradeable_usdt_perp_symbols(self) -> List[str]:
+        """Получить все торгуемые USDT-перпетуальные символы (linear swap)."""
+        try:
+            # Убеждаемся, что рынки загружены
+            await self.exchange.load_markets()
+            markets = self.exchange.markets or {}
+
+            symbols: List[str] = []
+            for symbol, market in markets.items():
+                # Пример символа: "BTC/USDT:USDT"
+                if ":USDT" not in symbol:
+                    continue
+                # Фильтр: только свопы (перпетуальные контракты)
+                is_swap = market.get('swap') or market.get('type') == 'swap' or market.get('contract')
+                if not is_swap:
+                    continue
+                # Фильтр: активные рынки
+                if market.get('active') is False:
+                    continue
+                symbols.append(symbol)
+
+            # Удаляем дубликаты, сортируем для стабильности
+            unique_symbols = sorted(list(set(symbols)))
+            logger.info(f"📄 Доступные USDT-перп символы: {len(unique_symbols)}")
+            return unique_symbols
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения списка рынков: {e}")
+            return []
     
     async def set_leverage(self, symbol: str, leverage: int) -> bool:
         """Установить леверидж"""
@@ -335,7 +364,30 @@ class ExchangeManager:
             )
             
             # Топ N
-            top_symbols = [symbol for symbol, _ in sorted_symbols[:top_n]]
+            filtered: List[str] = []
+            for symbol, ticker in sorted_symbols:
+                # Глобальный blacklist
+                if symbol in Config.EXCLUDED_SYMBOLS:
+                    continue
+                # Порог 24ч объема
+                if float(ticker.get("quoteVolume", 0) or 0) < Config.MIN_QUOTE_VOLUME_USD:
+                    continue
+                # Минимальная цена
+                last_price = float(ticker.get("last", 0) or 0)
+                if last_price and last_price < Config.MIN_PRICE_USD:
+                    continue
+                # Спред
+                bid = float(ticker.get('bid', 0) or 0)
+                ask = float(ticker.get('ask', 0) or 0)
+                if bid > 0 and ask > 0:
+                    spread_pct = ((ask - bid) / bid) * 100
+                    if spread_pct > Config.MAX_SPREAD_PERCENT:
+                        continue
+                filtered.append(symbol)
+                if len(filtered) >= top_n:
+                    break
+
+            top_symbols = filtered
             
             logger.info(f"📊 Топ {len(top_symbols)} символов по объему")
             return top_symbols

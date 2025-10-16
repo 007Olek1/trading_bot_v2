@@ -23,14 +23,15 @@ class VolatilityAnalyzer:
         """Анализ волатильности конкретного символа"""
         try:
             # ФИЛЬТР 2: Проверяем минимальный объем торгов
+            from bot_v2_config import Config
             ticker = await exchange_manager.exchange.fetch_ticker(symbol)
-            if not ticker or ticker.get('quoteVolume', 0) < 1000000:  # Минимум $1M объем
+            if not ticker or ticker.get('quoteVolume', 0) < Config.MIN_QUOTE_VOLUME_USD:
                 logger.debug(f"🚫 Исключен: {symbol} (низкий объем: ${ticker.get('quoteVolume', 0):,.0f})")
                 return {"volatility_score": 0, "trend_score": 0, "volume_score": 0}
             
             # ФИЛЬТР 3: Проверяем минимальную цену (исключаем слишком дешевые монеты)
             current_price = ticker.get('last', 0)
-            if current_price < 0.01:  # Минимум $0.01
+            if current_price < Config.MIN_PRICE_USD:
                 logger.debug(f"🚫 Исключен: {symbol} (слишком дешевый: ${current_price:.6f})")
                 return {"volatility_score": 0, "trend_score": 0, "volume_score": 0}
             
@@ -39,7 +40,7 @@ class VolatilityAnalyzer:
             ask = ticker.get('ask', 0)
             if bid > 0 and ask > 0:
                 spread_pct = ((ask - bid) / bid) * 100
-                if spread_pct > 2.0:  # Спред больше 2%
+                if spread_pct > Config.MAX_SPREAD_PERCENT:
                     logger.debug(f"🚫 Исключен: {symbol} (высокий спред: {spread_pct:.2f}%)")
                     return {"volatility_score": 0, "trend_score": 0, "volume_score": 0}
             

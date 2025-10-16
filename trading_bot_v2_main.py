@@ -282,23 +282,35 @@ class TradingBotV2:
                 await self.emergency_shutdown(reason)
                 return
             
-            # 4. Получаем ВОЛАТИЛЬНЫЕ символы с анализом трендов - ВСЕГДА анализируем рынок!
-            logger.info("🚀 Получение волатильных монет с анализом трендов...")
-            
-            # Проверяем кэш
-            if enhanced_symbol_selector.is_cache_valid():
-                symbols = enhanced_symbol_selector.get_cached_symbols()
-                logger.info(f"📊 Использую кэшированные символы: {len(symbols)}")
+            # 4. Получаем список символов для анализа
+            logger.info("🚀 Формирование торговой вселенной символов...")
+
+            symbols: List[str] = []
+            if Config.USE_DYNAMIC_SYMBOL_SELECTION:
+                # Динамический: берем ВСЕ доступные USDT-перпеты, фильтруем по ликвидности,
+                # затем выбираем топ волатильных
+                logger.info("📡 Динамический выбор монет включен")
+
+                # Пытаемся использовать кэш результатов волатильности
+                if enhanced_symbol_selector.is_cache_valid():
+                    symbols = enhanced_symbol_selector.get_cached_symbols()
+                    logger.info(f"📊 Использую кэшированные символы: {len(symbols)}")
+                else:
+                    # Базовый универсум: топ по объему (уже с ликвидность-фильтрами)
+                    base = await exchange_manager.get_top_volume_symbols(top_n=300)
+                    if not base:
+                        # Фоллбэк: все своп-символы
+                        base = await exchange_manager.get_all_tradeable_usdt_perp_symbols()
+                    # Включаем анализ волатильности и трендов с жесткими фильтрами
+                    volatile_symbols_data = await enhanced_symbol_selector.get_volatile_symbols(
+                        exchange_manager,
+                        top_n=min(Config.DYNAMIC_SYMBOLS_TOP_N, 150)
+                    )
+                    symbols = [data['symbol'] for data in volatile_symbols_data]
             else:
-                # Получаем свежий анализ волатильности
-                volatile_symbols_data = await enhanced_symbol_selector.get_volatile_symbols(
-                    exchange_manager, top_n=100
-                )
-                symbols = [data['symbol'] for data in volatile_symbols_data]
-                
-                if not symbols:
-                    logger.warning("⚠️ Не удалось получить волатильные символы, используем базовые")
-                    symbols = await exchange_manager.get_top_volume_symbols(top_n=50)
+                # Статический режим: используем список из конфига
+                logger.info("📄 Статический список монет (Config.TOP_100_SYMBOLS)")
+                symbols = Config.TOP_100_SYMBOLS
             
             if not symbols:
                 logger.warning("⚠️ Не удалось получить символы")

@@ -80,6 +80,40 @@ class Config:
     LOG_LEVEL = "DEBUG"
     
     # ========================================
+    # 💧 ЛИКВИДНОСТЬ И ВЫБОР СИМВОЛОВ
+    # ========================================
+    # Порог ликвидности (24ч объем в $, цена, спред)
+    MIN_QUOTE_VOLUME_USD = float(os.getenv("MIN_QUOTE_VOLUME_USD", "1000000"))  # ≥ $1M объема/24ч
+    MIN_PRICE_USD = float(os.getenv("MIN_PRICE_USD", "0.01"))                  # ≥ $0.01 цена
+    MAX_SPREAD_PERCENT = float(os.getenv("MAX_SPREAD_PERCENT", "2.0"))          # ≤ 2% спред
+
+    # Динамический выбор монет (вместо статического TOP 100)
+    USE_DYNAMIC_SYMBOL_SELECTION = True
+    DYNAMIC_SYMBOLS_TOP_N = int(os.getenv("DYNAMIC_SYMBOLS_TOP_N", "100"))
+
+    # Глобальный черный список символов (исключаются всегда)
+    EXCLUDED_SYMBOLS = {
+        # Малоликвидные/переименованные/нестабильные токены
+        'XPIN/USDT:USDT', 'KGEN/USDT:USDT', 'TWT/USDT:USDT', 'IN/USDT:USDT',
+
+        # «1000x» мем-индексы
+        '1000PEPE/USDT:USDT', '1000SHIB/USDT:USDT', '1000FLOKI/USDT:USDT',
+        '1000BONK/USDT:USDT', '1000WIF/USDT:USDT', '1000MEME/USDT:USDT',
+
+        # Слишком волатильные мемкоины
+        'DOGE/USDT:USDT', 'SHIB/USDT:USDT', 'PEPE/USDT:USDT', 'FLOKI/USDT:USDT',
+        'BONK/USDT:USDT', 'WIF/USDT:USDT', 'MEME/USDT:USDT', 'BABYDOGE/USDT:USDT',
+
+        # Проблемные DeFi токены (исторически низкая ликвидность/спреды)
+        'CRV/USDT:USDT', 'SNX/USDT:USDT', 'COMP/USDT:USDT', 'MKR/USDT:USDT',
+        'AAVE/USDT:USDT', 'UNI/USDT:USDT', 'SUSHI/USDT:USDT', '1INCH/USDT:USDT',
+
+        # Низколиквидные альткоины
+        'STORJ/USDT:USDT', 'ANKR/USDT:USDT', 'BAT/USDT:USDT', 'ZRX/USDT:USDT',
+        'KNC/USDT:USDT', 'REN/USDT:USDT', 'LRC/USDT:USDT', 'OMG/USDT:USDT'
+    }
+
+    # ========================================
     # 📅 РАСПИСАНИЕ
     # ========================================
     WEEKEND_REST = True
