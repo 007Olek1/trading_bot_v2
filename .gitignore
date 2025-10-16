@@ -33,3 +33,5 @@ state_*.json
 check_*.py
 *_temp.py
 
+venv/
+venv311/
