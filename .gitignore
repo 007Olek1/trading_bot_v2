@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+venv311/
+env/
+ENV/
+
+# Logs
+*.log
+logs/
+
+# Environment
+.env
+api.env
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+*.swp
+
+# Trading data
+*.json
+state_*.json
+
+# Temporary files
+check_*.py
+*_temp.py
+
