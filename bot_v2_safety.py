@@ -119,12 +119,21 @@ class RiskManager:
         """Расчет размера позиции (КОНСЕРВАТИВНО)"""
         base_size = Config.get_position_size()
         
-        # ИСПРАВЛЕНИЕ: Увеличиваем размер для крупных монет!
+        # ИСПРАВЛЕНИЕ: Адаптивный размер для максимальной прибыли!
         if symbol:
-            # ТОП монеты - больше размер для лучшей прибыли
-            top_coins = ['BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT', 'BNB/USDT:USDT', 'XRP/USDT:USDT']
-            if symbol in top_coins:
-                return base_size * 2.0  # $4 вместо $2 для крупных монет
+            # ТОП-5: x10 размер ($20-30) - МАКСИМАЛЬНАЯ ПРИБЫЛЬ!
+            top_5 = ['BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT', 'BNB/USDT:USDT', 'XRP/USDT:USDT']
+            if symbol in top_5:
+                return base_size * 10.0  # $20 для ТОП-5
+            
+            # ТОП-15: x7 размер ($15-20)
+            top_15 = ['ADA/USDT:USDT', 'DOGE/USDT:USDT', 'MATIC/USDT:USDT', 'DOT/USDT:USDT', 'AVAX/USDT:USDT',
+                      'LINK/USDT:USDT', 'UNI/USDT:USDT', 'ATOM/USDT:USDT', 'LTC/USDT:USDT', 'TRX/USDT:USDT']
+            if symbol in top_15:
+                return base_size * 7.0  # $14 для ТОП-15
+            
+            # Остальные ТОП-50: x5 размер ($10)
+            return base_size * 5.0  # $10 для остальных
         
         return base_size
     
