@@ -683,6 +683,7 @@ class TradingBotV2:
             
             # 5. Открываем позицию на бирже
             logger.info(f"💰 Создаю market ордер: {amount:.6f} @ ${current_price:.4f}")
+            logger.info(f"📊 Инвестирую: ${position_size_usd * Config.LEVERAGE:.2f} (${position_size_usd} x {Config.LEVERAGE}x)")
             market_order = await exchange_manager.create_market_order(symbol, side, amount)
             
             if not market_order:
@@ -698,7 +699,17 @@ class TradingBotV2:
             for pos in positions:
                 if pos['symbol'] == symbol and float(pos.get('contracts', 0)) > 0:
                     actual_amount = float(pos.get('contracts', 0))
+                    actual_investment = actual_amount * current_price
+                    expected_investment = position_size_usd * Config.LEVERAGE
+                    
                     logger.info(f"📊 Фактический размер позиции: {actual_amount} (расчетный был {amount:.6f})")
+                    logger.info(f"💰 Фактическая инвестиция: ${actual_investment:.4f} (ожидалось ${expected_investment:.2f})")
+                    
+                    # ПРОВЕРКА НА КРИТИЧЕСКУЮ ОШИБКУ!
+                    if actual_investment < expected_investment * 0.1:  # Меньше 10% от ожидаемого
+                        logger.error(f"🚨 КРИТИЧЕСКАЯ ОШИБКА! Позиция в {expected_investment/actual_investment:.1f} раз меньше ожидаемого!")
+                        logger.error(f"🚨 Ожидалось: ${expected_investment:.2f}, Получили: ${actual_investment:.4f}")
+                        health_monitor.record_error("position_size_error", f"Expected ${expected_investment:.2f}, got ${actual_investment:.4f}")
                     break
             
             # 6. КРИТИЧНО: Создаем Stop Loss ордер НА БИРЖЕ
