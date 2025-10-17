@@ -218,3 +218,4 @@ if volatility_signal:
 **Версия:** V2.1 Enhanced
 
 
+

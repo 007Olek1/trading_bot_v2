@@ -192,9 +192,13 @@ class TradingBotV2:
             self.telegram_app.add_handler(CommandHandler("pause", self.cmd_pause))
             self.telegram_app.add_handler(CommandHandler("resume", self.cmd_resume))
             
-            # Запуск Telegram в фоне (без polling - только уведомления)
+            # Запуск Telegram polling для приёма команд
             await self.telegram_app.initialize()
             await self.telegram_app.start()
+            
+            # Запускаем polling в фоновой задаче
+            logger.info("📱 Запуск Telegram polling для приёма команд...")
+            asyncio.create_task(self.telegram_app.updater.start_polling(drop_pending_updates=True))
             
             # 5. Планировщик задач
             scheduler = AsyncIOScheduler()

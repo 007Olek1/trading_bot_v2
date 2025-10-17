@@ -159,3 +159,4 @@ f"SL=${stop_loss:.4f} ({'+' if side == 'sell' else '-'}{Config.MAX_LOSS_PER_TRAD
   - SHORT: SL > Entry
 
 
+

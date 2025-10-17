@@ -325,3 +325,4 @@ GitHub: https://github.com/007Olek1/trading_bot_v2
 
 **УДАЧИ! 🎉**
 
+

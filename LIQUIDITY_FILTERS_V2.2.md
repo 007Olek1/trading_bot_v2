@@ -182,3 +182,4 @@ volatile_symbols_data = await enhanced_symbol_selector.get_volatile_symbols(
 **Версия:** V2.2 Filtered  
 **Статус:** ✅ ФИЛЬТРЫ АКТИВНЫ
 
+
