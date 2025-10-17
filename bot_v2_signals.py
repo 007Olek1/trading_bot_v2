@@ -260,23 +260,24 @@ class SignalAnalyzer:
             
             # DEBUG: Логируем детали расчета
             logger.debug(f"DEBUG: signals={len(signals)}, buy_score={buy_score:.2f}, sell_score={sell_score:.2f}")
+            logger.debug(f"DEBUG: buy_signals={len(buy_signals)}, sell_signals={len(sell_signals)}")
             
             # Определяем направление с НАКОПЛЕНИЕМ СЛАБЫХ СИГНАЛОВ
-            if buy_score > sell_score and buy_score >= 1.5:
+            if buy_score > sell_score and buy_score >= 1.2:  # СНИЗИЛИ С 1.5 до 1.2!
                 signal = "buy"
-                confidence = min(100, buy_score * 50)  # Увеличил с 40 до 50
+                confidence = min(100, buy_score * 55)  # УВЕЛИЧИЛИ с 50 до 55!
                 
                 # БОНУС: Если много слабых индикаторов в одну сторону
-                if len(buy_signals) >= 3 and buy_score >= 1.8:
-                    confidence = min(100, confidence * 1.3)  # +30% бонус
+                if len(buy_signals) >= 3 and buy_score >= 1.5:  # СНИЗИЛИ с 1.8 до 1.5
+                    confidence = min(100, confidence * 1.4)  # УВЕЛИЧИЛИ с 1.3 до 1.4 (+40% бонус!)
                     
-            elif sell_score > buy_score and sell_score >= 1.5:
+            elif sell_score > buy_score and sell_score >= 1.2:  # СНИЗИЛИ С 1.5 до 1.2!
                 signal = "sell" 
-                confidence = min(100, sell_score * 50)  # Увеличил с 40 до 50
+                confidence = min(100, sell_score * 55)  # УВЕЛИЧИЛИ с 50 до 55!
                 
                 # БОНУС: Если много слабых индикаторов в одну сторону
-                if len(sell_signals) >= 3 and sell_score >= 1.8:
-                    confidence = min(100, confidence * 1.2)  # +20% бонус
+                if len(sell_signals) >= 3 and sell_score >= 1.5:  # СНИЗИЛИ с 1.8 до 1.5
+                    confidence = min(100, confidence * 1.3)  # +30% бонус
                     
             else:
                 signal = None
@@ -284,6 +285,11 @@ class SignalAnalyzer:
             
             # Фильтр: минимальная уверенность
             if confidence < Config.MIN_CONFIDENCE_PERCENT:
+                logger.info(
+                    f"⚠️ Сигнал отклонен: {signal.upper() if signal else 'None'} | "
+                    f"Confidence {confidence:.1f}% < {Config.MIN_CONFIDENCE_PERCENT}% | "
+                    f"Score: {buy_score if signal=='buy' else sell_score:.2f}"
+                )
                 return {
                     "signal": None,
                     "confidence": confidence,
@@ -316,12 +322,17 @@ class SignalAnalyzer:
             
             # 3. Проверка количества согласных индикаторов
             if hasattr(Config, 'MIN_INDICATORS_AGREE'):
-                total_signals = len(buy_signals) + len(sell_signals)
-                if total_signals < Config.MIN_INDICATORS_AGREE:
+                # УЧИТЫВАЕМ ТОЛЬКО ИНДИКАТОРЫ В ОДНОМ НАПРАВЛЕНИИ!
+                active_signals = len(buy_signals) if signal == "buy" else len(sell_signals)
+                if active_signals < Config.MIN_INDICATORS_AGREE:
+                    logger.info(
+                        f"⚠️ Сигнал отклонен: Мало индикаторов | "
+                        f"{signal.upper()} имеет {active_signals} < {Config.MIN_INDICATORS_AGREE}"
+                    )
                     return {
                         "signal": None,
                         "confidence": confidence,
-                        "reason": f"Мало индикаторов: {total_signals} < {Config.MIN_INDICATORS_AGREE}"
+                        "reason": f"Мало индикаторов: {active_signals} < {Config.MIN_INDICATORS_AGREE}"
                     }
             
             return {
