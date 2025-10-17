@@ -66,12 +66,12 @@ class DatabaseManager:
                     success BOOLEAN,
                     open_time TIMESTAMP NOT NULL,
                     close_time TIMESTAMP,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    
-                    INDEX idx_symbol (symbol),
-                    INDEX idx_open_time (open_time),
-                    INDEX idx_success (success)
-                )
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                
+                CREATE INDEX IF NOT EXISTS idx_symbol ON trades(symbol);
+                CREATE INDEX IF NOT EXISTS idx_open_time ON trades(open_time);
+                CREATE INDEX IF NOT EXISTS idx_success ON trades(success);
             """)
             
             # Таблица ML признаков
@@ -107,12 +107,12 @@ class DatabaseManager:
                     actual_pnl DECIMAL(20, 8),
                     trade_id INTEGER REFERENCES trades(id),
                     
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    
-                    INDEX idx_symbol_ml (symbol),
-                    INDEX idx_created_at (created_at),
-                    INDEX idx_actual_success (actual_success)
-                )
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                
+                CREATE INDEX IF NOT EXISTS idx_symbol_ml ON ml_features(symbol);
+                CREATE INDEX IF NOT EXISTS idx_created_at_ml ON ml_features(created_at);
+                CREATE INDEX IF NOT EXISTS idx_actual_success ON ml_features(actual_success);
             """)
             
             # Таблица статистики
@@ -148,10 +148,10 @@ class DatabaseManager:
                     test_samples INTEGER,
                     is_active BOOLEAN DEFAULT TRUE,
                     
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    
-                    INDEX idx_active (is_active)
-                )
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                
+                CREATE INDEX IF NOT EXISTS idx_active ON ml_models(is_active);
             """)
             
             self.connection.commit()
