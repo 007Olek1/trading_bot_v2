@@ -446,6 +446,18 @@ class TradingBotV2:
             if not ohlcv:
                 return None
             
+            # ⏰ ПРОВЕРКА: Ждём закрытия текущей свечи!
+            # Последняя свеча должна быть закрыта (не текущая)
+            current_time = datetime.now().timestamp() * 1000  # В миллисекундах
+            last_candle_time = ohlcv[-1][0]  # Timestamp последней свечи
+            candle_duration = 5 * 60 * 1000  # 5 минут в миллисекундах
+            
+            # Если последняя свеча ещё не закрыта - пропускаем анализ
+            time_since_candle_open = current_time - last_candle_time
+            if time_since_candle_open < candle_duration * 0.9:  # Свеча ещё не закрыта (осталось >10% времени)
+                logger.debug(f"⏰ {symbol}: Жду закрытия свечи (осталось {(candle_duration - time_since_candle_open)/1000:.0f}с)")
+                return None
+            
             # Конвертируем в DataFrame
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             
@@ -1146,36 +1158,42 @@ class TradingBotV2:
                 current_sl = float(current_sl)
                 new_sl = None
                 
-                # ЛОГИКА TRAILING (ИСПРАВЛЕНА - МЕНЕЕ АГРЕССИВНАЯ):
-                # Для BUY: SL двигается ВВЕРХ при росте цены (вверх к текущей цене)
-                # Для SELL: SL двигается ВНИЗ при падении цены (вниз к текущей цене), НО НИКОГДА не ниже Entry!
+                # ЛОГИКА TRAILING (НОВАЯ - ЗАЩИТА ПРИБЫЛИ):
+                # Для BUY: SL двигается ВВЕРХ при росте цены
+                # Для SELL: SL двигается ВНИЗ при падении цены, НО НИКОГДА не ниже Entry!
+                # ВАЖНО: Trailing Stop должен защищать прибыль, а не убивать её!
                 
-                if profit_pct >= 15:  # Увеличено с 10% до 15%
+                if profit_pct >= 20:  # При +20% прибыли
+                    if side.lower() in ['buy', 'long']:
+                        new_sl = entry_price * 1.10  # +10% от Entry (50% прибыли защищено)
+                        trailing_level = "+10%"
+                    else:  # SELL
+                        new_sl = entry_price * 1.05  # +5% от Entry
+                        trailing_level = "+5%"
+                    
+                elif profit_pct >= 15:  # При +15% прибыли
+                    if side.lower() in ['buy', 'long']:
+                        new_sl = entry_price * 1.07   # +7% от Entry
+                        trailing_level = "+7%"
+                    else:  # SELL
+                        new_sl = entry_price * 1.03   # +3% от Entry
+                        trailing_level = "+3%"
+                    
+                elif profit_pct >= 10:  # При +10% прибыли
                     if side.lower() in ['buy', 'long']:
                         new_sl = entry_price * 1.05  # +5% от Entry
                         trailing_level = "+5%"
                     else:  # SELL
-                        # Для SELL при большой прибыли: SL = Entry + 2% (защита прибыли)
                         new_sl = entry_price * 1.02  # +2% от Entry
                         trailing_level = "+2%"
-                    
-                elif profit_pct >= 8:  # Увеличено с 5% до 8%
+                
+                elif profit_pct >= 7:  # При +7% прибыли
                     if side.lower() in ['buy', 'long']:
-                        new_sl = entry_price * 1.02   # +2% от Entry
+                        new_sl = entry_price * 1.02  # +2% от Entry
                         trailing_level = "+2%"
                     else:  # SELL
-                        # Для SELL: SL = Entry + 1%
-                        new_sl = entry_price * 1.01   # +1% от Entry
+                        new_sl = entry_price * 1.01  # +1% от Entry
                         trailing_level = "+1%"
-                    
-                elif profit_pct >= 5:  # Увеличено с 2% до 5%
-                    if side.lower() in ['buy', 'long']:
-                        new_sl = entry_price  # Безубыток
-                        trailing_level = "безубыток"
-                    else:  # SELL
-                        # Для SELL: SL = Entry + 0.2% (микро-защита, чтобы не закрыть в безубыток сразу)
-                        new_sl = entry_price * 1.002  # +0.2% от Entry
-                        trailing_level = "+0.2%"
                 
                 # Обновляем SL только если новый лучше текущего
                 if new_sl:
