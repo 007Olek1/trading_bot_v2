@@ -347,6 +347,9 @@ class TradingBotV2:
                 return
             
             # 8. Анализируем символы
+            analyzed_count = 0
+            signals_found = 0
+            
             for symbol in symbols:
                 if len(self.open_positions) >= Config.MAX_POSITIONS:
                     break
@@ -362,9 +365,20 @@ class TradingBotV2:
                     continue
                 
                 # Анализ
+                analyzed_count += 1
+                if analyzed_count % 50 == 0:  # Логируем каждые 50 монет
+                    logger.info(f"📊 Проанализировано {analyzed_count}/{len(symbols)} монет, найдено сигналов: {signals_found}")
+                
                 signal_result = await self.analyze_symbol(symbol)
                 
                 if signal_result and signal_result.get('signal'):
+                    signals_found += 1
+                    logger.info(
+                        f"🎯 СИГНАЛ #{signals_found}: {symbol} | {signal_result['signal']} | "
+                        f"Уверенность: {signal_result.get('confidence', 0):.1f}% | "
+                        f"Сила: {signal_result.get('strength', 0):.2f}"
+                    )
+                    
                     # Пытаемся открыть сделку
                     position = await self.open_position(
                         symbol=symbol,
@@ -376,7 +390,7 @@ class TradingBotV2:
                         logger.info(f"✅ Позиция открыта: {symbol}")
                         break  # Открыли одну - хватит
             
-            logger.info("✅ Торговый цикл завершен")
+            logger.info(f"✅ Торговый цикл завершен | Проанализировано: {analyzed_count} | Сигналов: {signals_found}")
             logger.info("=" * 60)
             
         except Exception as e:
