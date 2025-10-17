@@ -85,7 +85,8 @@ class Config:
     # ========================================
     # 📊 МОНИТОРИНГ
     # ========================================
-    HEALTH_CHECK_INTERVAL_SECONDS = 60  # Проверка каждую минуту
+    HEALTH_CHECK_INTERVAL_SECONDS = 30  # Проверка каждые 30 секунд
+    TRAILING_STOP_CHECK_SECONDS = 5     # Trailing Stop каждые 5 секунд (МАКСИМАЛЬНАЯ СКОРОСТЬ!)
     TELEGRAM_ALERTS_ENABLED = True
     LOG_LEVEL = "DEBUG"
     

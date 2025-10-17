@@ -224,6 +224,15 @@ class TradingBotV2:
                 seconds=Config.HEALTH_CHECK_INTERVAL_SECONDS
             )
             
+            # 🎯 TRAILING STOP - отдельный джоб каждые 15 секунд (КРИТИЧНО!)
+            scheduler.add_job(
+                self.update_trailing_stop_loss,
+                'interval',
+                seconds=Config.TRAILING_STOP_CHECK_SECONDS,
+                id='trailing_stop_job'
+            )
+            logger.info(f"🎯 Trailing Stop будет проверяться каждые {Config.TRAILING_STOP_CHECK_SECONDS} секунд")
+            
             # Heartbeat каждый час (СРАЗУ + каждый час)
             scheduler.add_job(
                 self.send_heartbeat,
@@ -1117,8 +1126,8 @@ class TradingBotV2:
                 if not healed:
                     await exchange_manager.connect()
             
-            # 3. TRAILING STOP LOSS - перемещаем SL за прибылью
-            await self.update_trailing_stop_loss()
+            # 3. TRAILING STOP теперь в отдельном джобе (каждые 15 сек)
+            # Здесь больше не вызываем
             
         except Exception as e:
             logger.error(f"❌ Ошибка health check: {e}")
