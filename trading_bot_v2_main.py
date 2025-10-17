@@ -765,11 +765,31 @@ class TradingBotV2:
             return None
     
     async def sync_positions_from_exchange(self):
-        """Синхронизация позиций с биржи"""
+        """Синхронизация позиций с биржи + проверка ручных закрытий"""
         try:
             exchange_positions = await exchange_manager.fetch_positions()
             
-            # Обновляем наш список
+            # КРИТИЧНО: Проверяем закрытые позиции!
+            closed_positions = []
+            for our_pos in self.open_positions:
+                symbol = our_pos['symbol']
+                found = False
+                
+                for ex_pos in exchange_positions:
+                    if ex_pos['symbol'] == symbol and float(ex_pos.get('contracts', 0)) > 0:
+                        found = True
+                        break
+                
+                if not found:
+                    # Позиция закрыта вручную!
+                    closed_positions.append(our_pos)
+                    logger.warning(f"⚠️ Позиция {symbol} закрыта вручную!")
+            
+            # Обрабатываем закрытые позиции
+            for closed_pos in closed_positions:
+                await self.handle_manual_close(closed_pos)
+            
+            # Обновляем наш список активных позиций
             self.open_positions = []
             
             for ex_pos in exchange_positions:
@@ -825,6 +845,88 @@ class TradingBotV2:
             
         except Exception as e:
             logger.error(f"❌ Ошибка синхронизации позиций: {e}")
+    
+    async def handle_manual_close(self, position: Dict[str, Any]):
+        """Обработка ручного закрытия позиции"""
+        try:
+            symbol = position['symbol']
+            side = position['side']
+            entry_price = position['entry_price']
+            amount = position['amount']
+            
+            logger.info(f"📊 Обрабатываю ручное закрытие: {symbol}")
+            
+            # Получаем цену закрытия из истории сделок
+            try:
+                trades = await exchange_manager.exchange.fetch_my_trades(symbol, limit=10)
+                exit_price = None
+                
+                # Ищем последнюю сделку противоположной стороны
+                close_side = "sell" if side == "buy" else "buy"
+                for trade in reversed(trades):
+                    if trade['side'] == close_side:
+                        exit_price = float(trade['price'])
+                        break
+                
+                if not exit_price:
+                    logger.warning(f"⚠️ Не удалось найти цену закрытия для {symbol}")
+                    return
+                    
+            except Exception as e:
+                logger.error(f"❌ Ошибка получения цены закрытия: {e}")
+                return
+            
+            # Рассчитываем прибыль
+            if side == "buy":
+                pnl = (exit_price - entry_price) * amount * Config.LEVERAGE
+                pnl_pct = ((exit_price - entry_price) / entry_price * 100) * Config.LEVERAGE
+            else:
+                pnl = (entry_price - exit_price) * amount * Config.LEVERAGE
+                pnl_pct = ((entry_price - exit_price) / entry_price * 100) * Config.LEVERAGE
+            
+            # Обновляем статистику
+            if pnl < 0:
+                risk_manager.record_loss(abs(pnl))
+            else:
+                risk_manager.record_win(pnl)
+            
+            # Записываем в AI агента
+            trading_bot_agent.record_trade(
+                profit=pnl,
+                win=(pnl > 0),
+                confidence=position.get('signal_confidence', 0)
+            )
+            
+            # Сохраняем в историю
+            await self.save_trade_to_history({
+                'symbol': symbol,
+                'side': side,
+                'amount': amount,
+                'entry_price': entry_price,
+                'exit_price': exit_price,
+                'pnl': pnl,
+                'pnl_percent': pnl_pct,
+                'reason': 'Ручное закрытие',
+                'confidence': position.get('signal_confidence', 0),
+                'timestamp': datetime.now()
+            })
+            
+            # Уведомление в Telegram
+            emoji = "✅" if pnl > 0 else "❌"
+            await self.send_telegram(
+                f"📊 *ПОЗИЦИЯ ЗАКРЫТА ВРУЧНУЮ*\n\n"
+                f"{emoji} {symbol} | {side.upper()}\n"
+                f"💰 Entry: ${entry_price:.4f}\n"
+                f"💰 Exit: ${exit_price:.4f}\n"
+                f"📈 PnL: ${pnl:+.2f} ({pnl_pct:+.1f}%)\n"
+                f"⏰ Время: {datetime.now().strftime('%H:%M:%S')}\n\n"
+                f"🤖 *РЕЗУЛЬТАТ:* {'Прибыль!' if pnl > 0 else 'Убыток'}"
+            )
+            
+            logger.info(f"✅ Ручное закрытие обработано: {symbol} PnL=${pnl:+.2f}")
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка обработки ручного закрытия: {e}")
     
     async def health_check(self):
         """Проверка здоровья бота с Auto-Healing"""
