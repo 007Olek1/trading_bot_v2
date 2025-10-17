@@ -115,9 +115,18 @@ class RiskManager:
         logger.info(f"📊 Дневной убыток: ${self.daily_loss:.2f}/{Config.MAX_DAILY_LOSS_USD}")
         logger.info(f"📊 Недельный убыток: ${self.weekly_loss:.2f}/{Config.MAX_WEEKLY_LOSS_USD}")
     
-    def calculate_position_size(self, balance: float) -> float:
+    def calculate_position_size(self, balance: float, symbol: str = None) -> float:
         """Расчет размера позиции (КОНСЕРВАТИВНО)"""
-        return Config.get_position_size()
+        base_size = Config.get_position_size()
+        
+        # ИСПРАВЛЕНИЕ: Увеличиваем размер для крупных монет!
+        if symbol:
+            # ТОП монеты - больше размер для лучшей прибыли
+            top_coins = ['BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT', 'BNB/USDT:USDT', 'XRP/USDT:USDT']
+            if symbol in top_coins:
+                return base_size * 2.0  # $4 вместо $2 для крупных монет
+        
+        return base_size
     
     def calculate_sl_tp_prices(
         self,

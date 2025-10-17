@@ -287,28 +287,16 @@ class TradingBotV2:
                 return
             
             # 4. Получаем ВОЛАТИЛЬНЫЕ символы с анализом трендов - ВСЕГДА анализируем рынок!
-            logger.info("🚀 Получение волатильных монет с анализом трендов...")
+            logger.info("🚀 Получение ТОП популярных монет...")
             
-            # Проверяем кэш
-            if enhanced_symbol_selector.is_cache_valid():
-                symbols = enhanced_symbol_selector.get_cached_symbols()
-                logger.info(f"📊 Использую кэшированные символы: {len(symbols)}")
-            else:
-                # Получаем свежий анализ волатильности
-                volatile_symbols_data = await enhanced_symbol_selector.get_volatile_symbols(
-                    exchange_manager, top_n=100
-                )
-                symbols = [data['symbol'] for data in volatile_symbols_data]
-                
-                if not symbols:
-                    logger.warning("⚠️ Не удалось получить волатильные символы, используем базовые")
-                    symbols = await exchange_manager.get_top_volume_symbols(top_n=50)
+            # ИСПРАВЛЕНИЕ: Используем ТОП монеты вместо волатильных!
+            symbols = await exchange_manager.get_top_volume_symbols(top_n=50)
             
             if not symbols:
-                logger.warning("⚠️ Не удалось получить символы")
+                logger.warning("⚠️ Не удалось получить ТОП символы")
                 return
             
-            logger.info(f"🔍 Анализ {len(symbols)} волатильных символов...")
+            logger.info(f"🔍 Анализ {len(symbols)} ТОП символов (BTC, ETH, SOL, BNB...)...")
             
             # Обновляем время анализа в Health Monitor
             health_monitor.record_successful_analysis()
@@ -534,7 +522,7 @@ class TradingBotV2:
             
             # 3. Рассчитываем размер позиции
             balance = await exchange_manager.get_balance()
-            position_size_usd = risk_manager.calculate_position_size(balance)
+            position_size_usd = risk_manager.calculate_position_size(balance, symbol)
             amount = (position_size_usd * Config.LEVERAGE) / current_price
             
             # 4. Рассчитываем SL и TP
