@@ -290,6 +290,40 @@ class SignalAnalyzer:
                     "reason": f"Уверенность {confidence:.0f}% < {Config.MIN_CONFIDENCE_PERCENT}%"
                 }
             
+            # ДОПОЛНИТЕЛЬНЫЕ ФИЛЬТРЫ КАЧЕСТВА:
+            # 1. Проверка объёма торгов
+            if hasattr(Config, 'MIN_VOLUME_24H'):
+                current_volume = df['volume'].tail(24).sum()  # Последние 24 свечи (2 часа)
+                avg_price = df['close'].tail(24).mean()
+                volume_usd = current_volume * avg_price
+                
+                if volume_usd < Config.MIN_VOLUME_24H:
+                    return {
+                        "signal": None,
+                        "confidence": confidence,
+                        "reason": f"Низкий объём: ${volume_usd:,.0f} < ${Config.MIN_VOLUME_24H:,.0f}"
+                    }
+            
+            # 2. Проверка цены
+            if hasattr(Config, 'MIN_PRICE'):
+                current_price = df['close'].iloc[-1]
+                if current_price < Config.MIN_PRICE:
+                    return {
+                        "signal": None,
+                        "confidence": confidence,
+                        "reason": f"Цена слишком низкая: ${current_price:.4f} < ${Config.MIN_PRICE}"
+                    }
+            
+            # 3. Проверка количества согласных индикаторов
+            if hasattr(Config, 'MIN_INDICATORS_AGREE'):
+                total_signals = len(buy_signals) + len(sell_signals)
+                if total_signals < Config.MIN_INDICATORS_AGREE:
+                    return {
+                        "signal": None,
+                        "confidence": confidence,
+                        "reason": f"Мало индикаторов: {total_signals} < {Config.MIN_INDICATORS_AGREE}"
+                    }
+            
             return {
                 "signal": signal,
                 "confidence": confidence,

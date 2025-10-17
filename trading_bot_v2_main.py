@@ -11,9 +11,10 @@ import asyncio
 import logging
 import sys
 import os
+import numpy as np
+import pandas as pd
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
-import pandas as pd
 import pytz
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -26,6 +27,7 @@ from bot_v2_safety import risk_manager, emergency_stop, position_guard
 from bot_v2_exchange import exchange_manager
 from bot_v2_signals import signal_analyzer
 from bot_v2_ai_agent import trading_bot_agent, health_monitor
+from bot_v2_self_learning import self_learning_system
 from bot_v2_auto_healing import auto_healing
 from bot_v2_volatility_analyzer import enhanced_symbol_selector
 
@@ -191,6 +193,8 @@ class TradingBotV2:
             self.telegram_app.add_handler(CommandHandler("stop", self.cmd_stop))
             self.telegram_app.add_handler(CommandHandler("pause", self.cmd_pause))
             self.telegram_app.add_handler(CommandHandler("resume", self.cmd_resume))
+            self.telegram_app.add_handler(CommandHandler("train", self.cmd_train_ml))
+            self.telegram_app.add_handler(CommandHandler("ml_stats", self.cmd_ml_stats))
             
             # Запуск Telegram polling для приёма команд
             await self.telegram_app.initialize()
@@ -448,6 +452,39 @@ class TradingBotV2:
             # Анализ сигнала
             signal_result = signal_analyzer.analyze(df)
             
+            # 🧠 ML ПРЕДСКАЗАНИЕ КАЧЕСТВА СИГНАЛА
+            if signal_result.get('signal'):
+                # Подготавливаем рыночные данные для ML
+                market_data = {
+                    'rsi': self._calculate_rsi(df),
+                    'macd_signal': self._calculate_macd_signal(df),
+                    'bollinger_position': self._calculate_bollinger_position(df),
+                    'ema_trend': self._calculate_ema_trend(df),
+                    'volume_ratio': self._calculate_volume_ratio(df),
+                    'stochastic': self._calculate_stochastic(df),
+                    'price': df['close'].iloc[-1],
+                    'volume_24h': df['volume'].tail(24).sum(),
+                    'volatility': self._calculate_volatility(df),
+                    'atr': self._calculate_atr(df)
+                }
+                
+                # Получаем ML предсказание
+                ml_prediction = self_learning_system.predict_signal_quality(signal_result, market_data)
+                
+                # Записываем признаки для обучения
+                self_learning_system.record_signal_features(symbol, signal_result, market_data)
+                
+                # Добавляем ML данные к результату
+                signal_result['ml_prediction'] = ml_prediction
+                
+                # Если ML не рекомендует торговать - отклоняем сигнал
+                if ml_prediction.get('recommendation') == 'skip':
+                    logger.info(f"🧠 ML отклонил сигнал {symbol}: {ml_prediction.get('reason')}")
+                    signal_result['signal'] = None
+                    signal_result['reason'] = f"ML отклонил: {ml_prediction.get('reason')}"
+                else:
+                    logger.info(f"🧠 ML одобрил сигнал {symbol}: {ml_prediction.get('reason')}")
+            
             # Записываем успешный анализ
             health_monitor.record_successful_analysis()
             
@@ -481,6 +518,98 @@ class TradingBotV2:
             logger.error(f"❌ Ошибка анализа {symbol}: {e}")
             health_monitor.record_error("analysis", str(e))
             return None
+    
+    def _calculate_rsi(self, df: pd.DataFrame, period: int = 14) -> float:
+        """Расчёт RSI"""
+        try:
+            delta = df['close'].diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+            rs = gain / loss
+            rsi = 100 - (100 / (1 + rs))
+            return float(rsi.iloc[-1]) if not pd.isna(rsi.iloc[-1]) else 50
+        except:
+            return 50
+    
+    def _calculate_macd_signal(self, df: pd.DataFrame) -> float:
+        """Расчёт MACD сигнала"""
+        try:
+            ema12 = df['close'].ewm(span=12).mean()
+            ema26 = df['close'].ewm(span=26).mean()
+            macd = ema12 - ema26
+            signal = macd.ewm(span=9).mean()
+            return float(macd.iloc[-1] - signal.iloc[-1]) if not pd.isna(macd.iloc[-1]) else 0
+        except:
+            return 0
+    
+    def _calculate_bollinger_position(self, df: pd.DataFrame, period: int = 20) -> float:
+        """Позиция цены относительно полос Боллинджера"""
+        try:
+            sma = df['close'].rolling(window=period).mean()
+            std = df['close'].rolling(window=period).std()
+            upper = sma + (std * 2)
+            lower = sma - (std * 2)
+            current_price = df['close'].iloc[-1]
+            
+            if current_price > upper.iloc[-1]:
+                return 1.0  # Выше верхней полосы
+            elif current_price < lower.iloc[-1]:
+                return -1.0  # Ниже нижней полосы
+            else:
+                # Нормализуем от -1 до 1
+                return (current_price - lower.iloc[-1]) / (upper.iloc[-1] - lower.iloc[-1]) * 2 - 1
+        except:
+            return 0
+    
+    def _calculate_ema_trend(self, df: pd.DataFrame) -> float:
+        """Тренд EMA"""
+        try:
+            ema20 = df['close'].ewm(span=20).mean()
+            ema50 = df['close'].ewm(span=50).mean()
+            return float(ema20.iloc[-1] - ema50.iloc[-1]) if not pd.isna(ema20.iloc[-1]) else 0
+        except:
+            return 0
+    
+    def _calculate_volume_ratio(self, df: pd.DataFrame, period: int = 20) -> float:
+        """Отношение текущего объёма к среднему"""
+        try:
+            current_volume = df['volume'].iloc[-1]
+            avg_volume = df['volume'].tail(period).mean()
+            return float(current_volume / avg_volume) if avg_volume > 0 else 1
+        except:
+            return 1
+    
+    def _calculate_stochastic(self, df: pd.DataFrame, period: int = 14) -> float:
+        """Расчёт Stochastic"""
+        try:
+            low_min = df['low'].rolling(window=period).min()
+            high_max = df['high'].rolling(window=period).max()
+            k_percent = 100 * ((df['close'] - low_min) / (high_max - low_min))
+            return float(k_percent.iloc[-1]) if not pd.isna(k_percent.iloc[-1]) else 50
+        except:
+            return 50
+    
+    def _calculate_volatility(self, df: pd.DataFrame, period: int = 20) -> float:
+        """Расчёт волатильности"""
+        try:
+            returns = df['close'].pct_change()
+            volatility = returns.rolling(window=period).std() * np.sqrt(24)  # Дневная волатильность
+            return float(volatility.iloc[-1]) if not pd.isna(volatility.iloc[-1]) else 0
+        except:
+            return 0
+    
+    def _calculate_atr(self, df: pd.DataFrame, period: int = 14) -> float:
+        """Расчёт Average True Range"""
+        try:
+            high_low = df['high'] - df['low']
+            high_close = np.abs(df['high'] - df['close'].shift())
+            low_close = np.abs(df['low'] - df['close'].shift())
+            
+            true_range = np.maximum(high_low, np.maximum(high_close, low_close))
+            atr = true_range.rolling(window=period).mean()
+            return float(atr.iloc[-1]) if not pd.isna(atr.iloc[-1]) else 0
+        except:
+            return 0
     
     async def open_position(
         self,
@@ -898,7 +1027,7 @@ class TradingBotV2:
             )
             
             # Сохраняем в историю
-            await self.save_trade_to_history({
+            trade_data = {
                 'symbol': symbol,
                 'side': side,
                 'amount': amount,
@@ -908,8 +1037,14 @@ class TradingBotV2:
                 'pnl_percent': pnl_pct,
                 'reason': 'Ручное закрытие',
                 'confidence': position.get('signal_confidence', 0),
-                'timestamp': datetime.now()
-            })
+                'timestamp': datetime.now(),
+                'duration_minutes': (datetime.now() - position.get('open_time', datetime.now())).total_seconds() / 60
+            }
+            
+            await self.save_trade_to_history(trade_data)
+            
+            # 🧠 ЗАПИСЫВАЕМ РЕЗУЛЬТАТ ДЛЯ ОБУЧЕНИЯ ML
+            self_learning_system.record_trade_result(trade_data)
             
             # Уведомление в Telegram
             emoji = "✅" if pnl > 0 else "❌"
@@ -1011,11 +1146,11 @@ class TradingBotV2:
                 current_sl = float(current_sl)
                 new_sl = None
                 
-                # ЛОГИКА TRAILING:
+                # ЛОГИКА TRAILING (ИСПРАВЛЕНА - МЕНЕЕ АГРЕССИВНАЯ):
                 # Для BUY: SL двигается ВВЕРХ при росте цены (вверх к текущей цене)
                 # Для SELL: SL двигается ВНИЗ при падении цены (вниз к текущей цене), НО НИКОГДА не ниже Entry!
                 
-                if profit_pct >= 10:
+                if profit_pct >= 15:  # Увеличено с 10% до 15%
                     if side.lower() in ['buy', 'long']:
                         new_sl = entry_price * 1.05  # +5% от Entry
                         trailing_level = "+5%"
@@ -1024,7 +1159,7 @@ class TradingBotV2:
                         new_sl = entry_price * 1.02  # +2% от Entry
                         trailing_level = "+2%"
                     
-                elif profit_pct >= 5:
+                elif profit_pct >= 8:  # Увеличено с 5% до 8%
                     if side.lower() in ['buy', 'long']:
                         new_sl = entry_price * 1.02   # +2% от Entry
                         trailing_level = "+2%"
@@ -1033,7 +1168,7 @@ class TradingBotV2:
                         new_sl = entry_price * 1.01   # +1% от Entry
                         trailing_level = "+1%"
                     
-                elif profit_pct >= 2:
+                elif profit_pct >= 5:  # Увеличено с 2% до 5%
                     if side.lower() in ['buy', 'long']:
                         new_sl = entry_price  # Безубыток
                         trailing_level = "безубыток"
@@ -1549,6 +1684,60 @@ class TradingBotV2:
         """Команда /stop"""
         await update.message.reply_text("🛑 Останавливаю бота...")
         await self.shutdown()
+    
+    async def cmd_train_ml(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда /train - обучение ML модели"""
+        await update.message.reply_text("🧠 Начинаю обучение ML модели...")
+        
+        try:
+            result = self_learning_system.train_model()
+            
+            if result.get('success'):
+                await update.message.reply_text(
+                    f"✅ *ML МОДЕЛЬ ОБУЧЕНА!*\n\n"
+                    f"📊 Точность: {result['accuracy']:.3f}\n"
+                    f"🎯 Precision: {result['precision']:.3f}\n"
+                    f"📈 Recall: {result['recall']:.3f}\n"
+                    f"🔥 F1-Score: {result['f1_score']:.3f}\n"
+                    f"📚 Образцов: {result['training_samples']}\n"
+                    f"🧪 Тестов: {result['test_samples']}\n\n"
+                    f"🤖 Модель готова к использованию!",
+                    parse_mode="Markdown"
+                )
+            else:
+                await update.message.reply_text(
+                    f"❌ *ОШИБКА ОБУЧЕНИЯ*\n\n"
+                    f"Причина: {result.get('error', 'Неизвестная ошибка')}\n\n"
+                    f"💡 Нужно больше данных для обучения",
+                    parse_mode="Markdown"
+                )
+                
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка: {e}")
+    
+    async def cmd_ml_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда /ml_stats - статистика ML"""
+        try:
+            stats = self_learning_system.get_learning_stats()
+            
+            await update.message.reply_text(
+                f"🧠 *СТАТИСТИКА ML СИСТЕМЫ*\n\n"
+                f"📊 Всего сделок: {stats['total_trades']}\n"
+                f"✅ Успешных: {stats['successful_trades']}\n"
+                f"📈 Win Rate: {stats['success_rate']:.1%}\n"
+                f"💰 Общий PnL: ${stats['total_pnl']:.2f}\n"
+                f"📊 Средний PnL: ${stats['avg_pnl']:.2f}\n\n"
+                f"🔍 Признаков собрано: {stats['features_count']}\n"
+                f"✅ Завершённых: {stats['completed_features']}\n\n"
+                f"🤖 Модель обучена: {'Да' if stats['is_trained'] else 'Нет'}\n"
+                f"🔄 Нужно переобучение: {'Да' if stats['should_retrain'] else 'Нет'}\n"
+                f"📚 Минимум для обучения: {stats['min_trades_for_training']}\n"
+                f"🎯 ML порог уверенности: {stats['ml_confidence_threshold']:.1f}",
+                parse_mode="Markdown"
+            )
+            
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка: {e}")
 
 
 async def main():
