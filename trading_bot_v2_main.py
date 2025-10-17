@@ -303,7 +303,7 @@ class TradingBotV2:
             logger.info("🚀 Получение ТОП популярных монет...")
             
             # ИСПРАВЛЕНИЕ: Используем ТОП монеты вместо волатильных!
-            symbols = await exchange_manager.get_top_volume_symbols(top_n=50)
+            symbols = await exchange_manager.get_top_volume_symbols(top_n=100)
             
             if not symbols:
                 logger.warning("⚠️ Не удалось получить ТОП символы")
