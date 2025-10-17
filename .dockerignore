@@ -1,0 +1,53 @@
+# Git
+.git
+.gitignore
+.github
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+venv311/
+env/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs (монтируются через volume)
+logs/*.log
+
+# ML данные (монтируются через volume)
+ml_data/
+
+# Временные файлы
+*.tmp
+*.bak
+*.cache
+.DS_Store
+
+# Documentation
+*.md
+!README.md
+
+# Docker
+docker-compose.override.yml
+Dockerfile.dev
+
+# Тестовые файлы
+test_*.py
+*_temp.py
+check_*.py
+verify_*.py
+analyze_*.py
+

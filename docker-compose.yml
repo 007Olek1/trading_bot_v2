@@ -1,0 +1,53 @@
+version: '3.8'
+
+services:
+  trading_bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: trading_bot_v2
+    restart: unless-stopped
+    
+    # Переменные окружения из .env файла
+    env_file:
+      - .env
+    
+    # Монтируем volume для логов и ML данных
+    volumes:
+      - ./logs:/app/logs
+      - ./ml_data:/app/ml_data
+      - ./trade_history.json:/app/trade_history.json
+    
+    # Логирование
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    
+    # Ограничения ресурсов
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+    
+    # Healthcheck
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import os; exit(0 if os.path.exists('logs/bot_v2.log') else 1)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    
+    # Сеть
+    networks:
+      - bot_network
+
+networks:
+  bot_network:
+    driver: bridge
+
