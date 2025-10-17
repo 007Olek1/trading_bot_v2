@@ -5,6 +5,10 @@
 
 import ccxt.async_support as ccxt
 import logging
+import random
+import math
+import time
+from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
 from bot_v2_config import Config
 
@@ -17,10 +21,181 @@ class ExchangeManager:
     def __init__(self):
         self.exchange = None
         self.connected = False
+        self._using_mock = False
+    
+    # ======================
+    # ВСТРОЕННАЯ MOCK-БИРЖА
+    # ======================
+    class _MockBybit:
+        """Простая имитация биржи для офлайн-тестов"""
+        def __init__(self, symbols: List[str]):
+            self._symbols = symbols[:]
+            if not self._symbols:
+                # Базовый набор если не передали
+                self._symbols = [
+                    'BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT', 'BNB/USDT:USDT', 'XRP/USDT:USDT'
+                ]
+            self._balance_usdt = 100.0
+            self._positions: Dict[str, Dict[str, Any]] = {}
+            self._open_orders: List[Dict[str, Any]] = []
+            self._leverage_by_symbol: Dict[str, int] = {}
+            self._start_ts_ms = int(time.time() * 1000) - (60 * 60 * 1000)
+            # Имитация рынков с минимальным размером 0.01
+            self.markets = {sym: {'precision': {'price': 2}, 'limits': {'amount': {'min': 0.01}}} for sym in self._symbols}
+        
+        async def close(self):
+            return True
+        
+        async def set_leverage(self, leverage: int, symbol: str):
+            self._leverage_by_symbol[symbol] = leverage
+            return True
+        
+        async def fetch_balance(self):
+            return {"USDT": {"free": self._balance_usdt}}
+        
+        async def fetch_tickers(self):
+            # Генерируем тикеры с псевдо-объемом
+            tickers = {}
+            for i, sym in enumerate(self._symbols):
+                base_price = 10 + i * 5
+                last = base_price * (1 + (math.sin(time.time() / 300 + i) * 0.05))
+                tickers[sym] = {
+                    'symbol': sym,
+                    'last': last,
+                    'bid': last * 0.999,
+                    'ask': last * 1.001,
+                    'quoteVolume': 1_000_000 + (len(self._symbols) - i) * 10_000,
+                }
+            return tickers
+        
+        def _gen_price_series(self, start_price: float, steps: int, volatility: float) -> List[float]:
+            price = start_price
+            series = []
+            for _ in range(steps):
+                drift = 0.0002
+                shock = random.uniform(-volatility, volatility)
+                price = max(0.0001, price * (1 + drift + shock))
+                series.append(price)
+            return series
+        
+        async def fetch_ohlcv(self, symbol: str, timeframe: str = "5m", limit: int = 100):
+            # Псевдо OHLCV на основе случайного блуждания
+            seed = abs(hash(symbol + timeframe)) % 1_000_000
+            random.seed(seed)
+            base = 10 + (abs(hash(symbol)) % 100) / 3
+            vol = 0.003 if timeframe in ("1m", "5m") else 0.001
+            closes = self._gen_price_series(base, limit, vol)
+            ohlcv = []
+            tf_minutes = 1
+            if timeframe.endswith('m'):
+                tf_minutes = int(timeframe[:-1])
+            elif timeframe.endswith('h'):
+                tf_minutes = int(timeframe[:-1]) * 60
+            elif timeframe.endswith('d'):
+                tf_minutes = int(timeframe[:-1]) * 60 * 24
+            ts = self._start_ts_ms
+            for c in closes:
+                high = c * (1 + random.uniform(0, 0.002))
+                low = c * (1 - random.uniform(0, 0.002))
+                open_ = (high + low) / 2
+                volume = random.uniform(1000, 10000)
+                ohlcv.append([ts, open_, high, low, c, volume])
+                ts += tf_minutes * 60 * 1000
+            return ohlcv
+        
+        async def create_market_order(self, symbol: str, side: str, amount: float):
+            # Цена по последнему close
+            candles = await self.fetch_ohlcv(symbol, limit=1)
+            price = float(candles[-1][4]) if candles else 1.0
+            position = self._positions.get(symbol)
+            if not position:
+                position = {
+                    'symbol': symbol,
+                    'side': 'long' if side.lower() == 'buy' else 'short',
+                    'contracts': float(amount),
+                    'entryPrice': price,
+                    'markPrice': price,
+                    'leverage': self._leverage_by_symbol.get(symbol, 5),
+                    'info': {'stopLoss': None},
+                }
+            else:
+                # Простая логика: заменяем позицию
+                position['side'] = 'long' if side.lower() == 'buy' else 'short'
+                position['contracts'] = float(amount)
+                position['entryPrice'] = price
+                position['markPrice'] = price
+            self._positions[symbol] = position
+            return {'id': f'MOCK_MKT_{symbol}_{int(time.time()*1000)}', 'symbol': symbol, 'price': price}
+        
+        async def private_post_v5_position_trading_stop(self, payload: Dict[str, Any]):
+            symbol = payload.get('symbol')  # ожид. TAOUSDT
+            # Преобразуем обратно к формату с ":USDT"
+            # Поиск по сохраненным символам, у которых без "/" совпадает
+            for full_sym in self._positions.keys():
+                if full_sym.split(':')[0].replace('/', '') == symbol:
+                    mock_symbol = full_sym
+                    break
+            else:
+                # Если позиции нет, просто ок
+                return {'retCode': 0, 'retMsg': 'OK'}
+            pos = self._positions.get(mock_symbol)
+            if pos:
+                pos['info']['stopLoss'] = str(payload.get('stopLoss'))
+            return {'retCode': 0, 'retMsg': 'OK'}
+        
+        async def create_limit_order(self, symbol: str, side: str, amount: float, price: float, params: Dict[str, Any] = None):
+            order = {
+                'id': f'MOCK_LIM_{symbol}_{int(price*100)}_{int(time.time()*1000)}',
+                'symbol': symbol,
+                'type': 'limit',
+                'side': side,
+                'amount': float(amount),
+                'price': float(price),
+                'reduceOnly': bool(params.get('reduceOnly') if params else False)
+            }
+            self._open_orders.append(order)
+            return order
+        
+        async def cancel_order(self, order_id: str, symbol: str):
+            self._open_orders = [o for o in self._open_orders if o.get('id') != order_id]
+            return True
+        
+        async def fetch_open_orders(self, symbol: Optional[str] = None):
+            if symbol:
+                return [o for o in self._open_orders if o.get('symbol') == symbol]
+            return list(self._open_orders)
+        
+        async def fetch_positions(self):
+            # Возвращаем только позиции с контрактами > 0
+            result = []
+            for sym, pos in self._positions.items():
+                if float(pos.get('contracts', 0)) > 0:
+                    result.append({
+                        'symbol': sym,
+                        'side': pos['side'],
+                        'contracts': pos['contracts'],
+                        'entryPrice': pos['entryPrice'],
+                        'markPrice': pos['markPrice'],
+                        'leverage': pos.get('leverage', 5),
+                        'stopLoss': pos['info'].get('stopLoss'),
+                        'info': pos['info']
+                    })
+            return result
+        
+        async def load_markets(self):
+            # Возвращаем словарь рынков
+            return self.markets
     
     async def connect(self):
         """Подключение к Bybit"""
         try:
+            if getattr(Config, 'OFFLINE_MODE', False):
+                logger.warning("🌐 OFFLINE MODE: используем имитацию биржи для тестов")
+                self.exchange = self._MockBybit(getattr(Config, 'TOP_100_SYMBOLS', []))
+                self._using_mock = True
+                self.connected = True
+                return True
+            
             self.exchange = ccxt.bybit({
                 "apiKey": Config.BYBIT_API_KEY,
                 "secret": Config.BYBIT_API_SECRET,
@@ -29,7 +204,7 @@ class ExchangeManager:
             })
             
             # Проверка подключения
-            balance = await self.exchange.fetch_balance()
+            await self.exchange.fetch_balance()
             self.connected = True
             
             logger.info("✅ Подключение к Bybit успешно")
@@ -37,6 +212,13 @@ class ExchangeManager:
             
         except Exception as e:
             logger.error(f"❌ Ошибка подключения к Bybit: {e}")
+            # Фолбэк: при тестовом режиме включаем MOCK, чтобы можно было тестировать
+            if getattr(Config, 'TEST_MODE', False):
+                logger.warning("🧪 Тестовый режим: переключаюсь на OFFLINE MOCK биржу")
+                self.exchange = self._MockBybit(getattr(Config, 'TOP_100_SYMBOLS', []))
+                self._using_mock = True
+                self.connected = True
+                return True
             self.connected = False
             return False
     
@@ -125,14 +307,13 @@ class ExchangeManager:
             # Этот метод устанавливает SL для СУЩЕСТВУЮЩЕЙ позиции
             
             # Получаем информацию о паре для правильного форматирования цены
-            markets = self.exchange.markets
+            markets = getattr(self.exchange, 'markets', {})
             if symbol in markets:
                 # precision может быть float (0.01) или int (2)
-                price_prec = markets[symbol].get('precision', {}).get('price', 2)
+                price_prec = markets.get(symbol, {}).get('precision', {}).get('price', 2)
                 # Преобразуем в кол-во знаков после запятой
                 if isinstance(price_prec, float):
                     # 0.01 -> 2, 0.1 -> 1, 0.001 -> 3
-                    import math
                     decimal_places = int(abs(math.log10(price_prec)))
                 else:
                     decimal_places = int(price_prec)

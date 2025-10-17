@@ -22,7 +22,7 @@ class Config:
     # ========================================
     # 💰 РАЗМЕР ПОЗИЦИЙ (УЛЬТРА-КОНСЕРВАТИВНО!)
     # ========================================
-    TEST_MODE = False                   # ✅ РЕАЛЬНЫЙ РЕЖИМ АКТИВИРОВАН
+    TEST_MODE = True                    # 🧪 Запустить в тестовом режиме без ключей
     TEST_POSITION_SIZE_USD = 1.0        # $1 на сделку в тесте
     TEST_MAX_TRADES = 3                 # Только 3 тестовых сделки
     
@@ -76,8 +76,9 @@ class Config:
     # 📊 МОНИТОРИНГ
     # ========================================
     HEALTH_CHECK_INTERVAL_SECONDS = 60  # Проверка каждую минуту
-    TELEGRAM_ALERTS_ENABLED = True
+    TELEGRAM_ALERTS_ENABLED = False     # Отключаем уведомления при отладке на сервере
     LOG_LEVEL = "DEBUG"
+    OFFLINE_MODE = True               # 🌐 Использовать офлайн-имитацию биржи при отладке
     
     # ========================================
     # 📅 РАСПИСАНИЕ
@@ -155,12 +156,19 @@ class Config:
         """Проверка конфигурации перед запуском"""
         errors = []
         
-        if not cls.BYBIT_API_KEY:
-            errors.append("❌ BYBIT_API_KEY не установлен")
-        if not cls.BYBIT_API_SECRET:
-            errors.append("❌ BYBIT_API_SECRET не установлен")
-        if not cls.TELEGRAM_BOT_TOKEN:
-            errors.append("❌ TELEGRAM_BOT_TOKEN не установлен")
+        # Проверка ключей биржи (разрешаем пропуск в TEST_MODE)
+        if not cls.TEST_MODE:
+            if not cls.BYBIT_API_KEY:
+                errors.append("❌ BYBIT_API_KEY не установлен")
+            if not cls.BYBIT_API_SECRET:
+                errors.append("❌ BYBIT_API_SECRET не установлен")
+        
+        # Проверка Telegram только если включены уведомления
+        if cls.TELEGRAM_ALERTS_ENABLED:
+            if not cls.TELEGRAM_BOT_TOKEN:
+                errors.append("❌ TELEGRAM_BOT_TOKEN не установлен")
+            if not cls.TELEGRAM_CHAT_ID:
+                errors.append("❌ TELEGRAM_CHAT_ID не установлен")
         if cls.MAX_LOSS_PER_TRADE_PERCENT >= cls.TAKE_PROFIT_MIN_PERCENT:
             errors.append("❌ SL должен быть меньше TP!")
         if cls.LEVERAGE > 5:

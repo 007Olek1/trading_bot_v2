@@ -61,6 +61,7 @@ class TradingBotV2:
         self.open_positions: List[Dict[str, Any]] = []
         self.bot_errors_count = 0
         self.last_heartbeat = datetime.now()
+        self.telegram_app = None
         # Символы, по которым прямо сейчас идет открытие позиции (анти-дубликаты)
         self.pending_symbols = set()
         
@@ -181,22 +182,25 @@ class TradingBotV2:
             await self.sync_positions_from_exchange()
             
             # 4. Запуск Telegram
-            logger.info("📱 Запуск Telegram бота...")
-            self.telegram_app = Application.builder().token(Config.TELEGRAM_BOT_TOKEN).build()
-            
-            # Команды
-            self.telegram_app.add_handler(CommandHandler("start", self.cmd_start))
-            self.telegram_app.add_handler(CommandHandler("status", self.cmd_status))
-            self.telegram_app.add_handler(CommandHandler("positions", self.cmd_positions))
-            self.telegram_app.add_handler(CommandHandler("history", self.cmd_history))
-            self.telegram_app.add_handler(CommandHandler("close_all", self.cmd_close_all))
-            self.telegram_app.add_handler(CommandHandler("stop", self.cmd_stop))
-            self.telegram_app.add_handler(CommandHandler("pause", self.cmd_pause))
-            self.telegram_app.add_handler(CommandHandler("resume", self.cmd_resume))
-            
-            # Запуск Telegram в фоне (без polling - только уведомления)
-            await self.telegram_app.initialize()
-            await self.telegram_app.start()
+            if Config.TELEGRAM_ALERTS_ENABLED and Config.TELEGRAM_BOT_TOKEN:
+                logger.info("📱 Запуск Telegram бота...")
+                self.telegram_app = Application.builder().token(Config.TELEGRAM_BOT_TOKEN).build()
+                
+                # Команды
+                self.telegram_app.add_handler(CommandHandler("start", self.cmd_start))
+                self.telegram_app.add_handler(CommandHandler("status", self.cmd_status))
+                self.telegram_app.add_handler(CommandHandler("positions", self.cmd_positions))
+                self.telegram_app.add_handler(CommandHandler("history", self.cmd_history))
+                self.telegram_app.add_handler(CommandHandler("close_all", self.cmd_close_all))
+                self.telegram_app.add_handler(CommandHandler("stop", self.cmd_stop))
+                self.telegram_app.add_handler(CommandHandler("pause", self.cmd_pause))
+                self.telegram_app.add_handler(CommandHandler("resume", self.cmd_resume))
+                
+                # Запуск Telegram в фоне (без polling - только уведомления)
+                await self.telegram_app.initialize()
+                await self.telegram_app.start()
+            else:
+                logger.info("📪 Telegram отключен (TELEGRAM_ALERTS_ENABLED=False или токен не задан)")
             
             # 5. Планировщик задач
             scheduler = AsyncIOScheduler()
