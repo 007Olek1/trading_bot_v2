@@ -882,15 +882,21 @@ class TradingBotV2:
             sl_pct = abs((stop_loss - current_price) / current_price * 100)
             loss_usd = invested * (sl_pct / 100) * Config.LEVERAGE
             
+            # Компактная версия для первых 2 TP
+            tp_short = ""
+            for i in range(min(2, len(take_profits))):
+                tp_price = take_profits[i]
+                tp_pct_str = self.format_price_change_pct(current_price, tp_price, side)
+                tp_short += f"${tp_price:.4f} ({tp_pct_str})"
+                if i < min(1, len(take_profits) - 1):
+                    tp_short += " → "
+            
             await self.send_telegram(
-                f"🟢 ПОЗИЦИЯ ОТКРЫТА\n\n"
-                f"💎 {symbol} | {side.upper()} | {Config.LEVERAGE}X\n"
-                f"💰 Entry: ${current_price:.4f}\n"
-                f"💵 Инвестировано: ${invested:.2f}\n\n"
-                f"🎯 Targets:\n{targets_text}\n"
-                f"🛡️ Stop Loss: ${stop_loss:.4f} ({sl_pct_str} = -${loss_usd:.2f})\n\n"
-                f"🎲 Уверенность: {signal_data['confidence']:.0f}%\n"
-                f"⏰ {datetime.now().strftime('%H:%M:%S')}"
+                f"🟢 *{symbol.split('/')[0]}* {side.upper()}\n"
+                f"💰 ${current_price:.4f} | ${invested:.2f}\n"
+                f"🎯 {tp_short}\n"
+                f"🛡️ SL: ${stop_loss:.4f} ({sl_pct_str})\n"
+                f"⚡ {signal_data['confidence']:.0f}%"
             )
             
             logger.info(f"✅ Позиция {symbol} успешно открыта с защитой!")
@@ -1061,13 +1067,9 @@ class TradingBotV2:
             # Уведомление в Telegram
             emoji = "✅" if pnl > 0 else "❌"
             await self.send_telegram(
-                f"📊 *ПОЗИЦИЯ ЗАКРЫТА ВРУЧНУЮ*\n\n"
-                f"{emoji} {symbol} | {side.upper()}\n"
-                f"💰 Entry: ${entry_price:.4f}\n"
-                f"💰 Exit: ${exit_price:.4f}\n"
-                f"📈 PnL: ${pnl:+.2f} ({pnl_pct:+.1f}%)\n"
-                f"⏰ Время: {datetime.now().strftime('%H:%M:%S')}\n\n"
-                f"🤖 *РЕЗУЛЬТАТ:* {'Прибыль!' if pnl > 0 else 'Убыток'}"
+                f"{emoji} *{symbol.split('/')[0]}* Вручную\n"
+                f"${entry_price:.4f} → ${exit_price:.4f}\n"
+                f"💰 {pnl:+.2f}$ ({pnl_pct:+.1f}%)"
             )
             
             logger.info(f"✅ Ручное закрытие обработано: {symbol} PnL=${pnl:+.2f}")
@@ -1227,11 +1229,8 @@ class TradingBotV2:
                             logger.info(f"🎯 Trailing SL обновлен для {symbol}: {current_sl:.4f} → {new_sl:.4f} ({trailing_level})")
                             
                             await self.send_telegram(
-                                f"🎯 *TRAILING STOP*\n\n"
-                                f"💎 {symbol}\n"
-                                f"📈 Прибыль: +{profit_pct:.1f}%\n"
-                                f"🛡️ Новый SL: ${new_sl:.4f} ({trailing_level})\n"
-                                f"✅ Прибыль защищена!"
+                                f"🎯 *{symbol.split('/')[0]}* TSL\n"
+                                f"📈 +{profit_pct:.1f}% → SL ${new_sl:.4f} ({trailing_level})"
                             )
             
         except Exception as e:
@@ -1296,23 +1295,13 @@ class TradingBotV2:
             health_emoji = "✅" if health_report['is_healthy'] else "⚠️"
             
             await self.send_telegram(
-                f"💓 *HEARTBEAT - БОТ V2.0*\n\n"
-                f"{status_emoji} *Статус:* {'Работает' if self.running and not self.paused else 'Пауза' if self.paused else 'Остановлен'}\n"
-                f"⏰ *Время:* {warsaw_time.strftime('%H:%M:%S')} (Варшава)\n"
+                f"💓 *БОТ V2* | {warsaw_time.strftime('%H:%M')}\n\n"
+                f"{status_emoji} {'Работает' if self.running and not self.paused else 'Пауза'}\n"
                 f"{positions_text}\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"{test_mode_text}\n"
-                f"📈 *P&L сегодня:* ${-risk_manager.daily_loss:.2f}\n"
-                f"🔢 *Сделок:* {risk_manager.trades_today}/{Config.MAX_TRADES_PER_DAY}\n"
-                f"🔄 *Серия убытков:* {risk_manager.consecutive_losses}\n\n"
-                f"🤖 *AI АГЕНТ:*\n"
-                f"   Win Rate: {agent_report['win_rate']:.0%}\n"
-                f"   Profit Factor: {agent_report['profit_factor']:.2f}\n"
-                f"   Всего сделок: {agent_report['total_trades']}\n\n"
-                f"{health_emoji} *ЗДОРОВЬЕ:*\n"
-                f"   Статус: {health_report['health_status']}\n"
-                f"   Ошибок: {health_report['total_errors']}\n"
-                f"   Healing попыток: {auto_healing.healing_attempts}"
+                f"📊 Сделок: {risk_manager.trades_today}/{Config.MAX_TRADES_PER_DAY} | "
+                f"P&L: ${risk_manager.get_daily_pnl():.2f}\n"
+                f"🎯 WR: {agent_report['win_rate']:.0%} | "
+                f"{health_emoji} {health_report['health_status']}"
             )
             
         except Exception as e:
@@ -1511,15 +1500,12 @@ class TradingBotV2:
             self.open_positions = [p for p in self.open_positions if p['symbol'] != symbol]
             
             # 9. Уведомление
-            emoji = "🟢" if pnl > 0 else "🔴"
+            emoji = "✅" if pnl > 0 else "❌"
+            reason_short = reason.replace("Trailing Stop", "TSL").replace("Take Profit", "TP").replace("Stop Loss", "SL")
             await self.send_telegram(
-                f"{emoji} ПОЗИЦИЯ ЗАКРЫТА\n\n"
-                f"💎 {symbol}\n"
-                f"📍 Причина: {reason}\n"
-                f"💰 Вход: ${entry_price:.4f}\n"
-                f"💵 Выход: ${exit_price:.4f}\n"
-                f"📊 P&L: ${pnl:.2f} ({pnl_pct:+.1f}%)\n"
-                f"⏰ {datetime.now().strftime('%H:%M:%S')}"
+                f"{emoji} *{symbol.split('/')[0]}* {reason_short}\n"
+                f"${entry_price:.4f} → ${exit_price:.4f}\n"
+                f"💰 {pnl:+.2f}$ ({pnl_pct:+.1f}%)"
             )
             
             logger.info(f"✅ Позиция {symbol} закрыта: {pnl:+.2f} ({pnl_pct:+.1f}%)")
