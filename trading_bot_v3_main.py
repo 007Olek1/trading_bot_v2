@@ -709,9 +709,9 @@ class TradingBotV2:
                 tp_amount = amount * tp_percentages[i]
                 
                 # Создаем ордер
-            tp_order = await exchange_manager.create_limit_order(
-                symbol=symbol,
-                side=close_side,
+                tp_order = await exchange_manager.create_limit_order(
+                    symbol=symbol,
+                    side=close_side,
                     amount=tp_amount,
                     price=tp_price
                 )
@@ -869,10 +869,10 @@ class TradingBotV2:
                 
                 # Если SL отсутствует или равен 0
                 if not stop_loss or stop_loss == "" or stop_loss == "0":
-                        logger.critical(
+                    logger.critical(
                         f"🚨 {symbol}: ПОЗИЦИЯ БЕЗ SL (реальная проверка биржи)! "
-                            f"Auto-Healing активирован!"
-                        )
+                        f"Auto-Healing активирован!"
+                    )
                     health_monitor.record_error("missing_sl_order", symbol)
                     
                     # Создаем SL немедленно
