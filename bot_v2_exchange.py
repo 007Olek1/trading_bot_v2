@@ -317,15 +317,32 @@ class ExchangeManager:
             return None
     
     async def get_top_volume_symbols(self, top_n: int = 50) -> List[str]:
-        """Получить топ символы по объему"""
+        """Получить топ символы по объему с фильтрацией ликвидности"""
         try:
             tickers = await self.exchange.fetch_tickers()
             
-            # Фильтр: только USDT perpetual
-            usdt_perp = {
-                symbol: ticker for symbol, ticker in tickers.items()
-                if ":USDT" in symbol and ticker.get("quoteVolume", 0) > 0
-            }
+            # Фильтр: только USDT perpetual с минимальной ликвидностью
+            usdt_perp = {}
+            for symbol, ticker in tickers.items():
+                if ":USDT" in symbol:
+                    volume = ticker.get("quoteVolume", 0)
+                    price = ticker.get("last", 0)
+                    
+                    # Фильтры ликвидности:
+                    # 1. Минимальный объем торгов $500,000
+                    # 2. Минимальная цена $0.001 (исключаем слишком дешевые)
+                    # 3. Проверяем спред если доступен
+                    if volume >= 500000 and price >= 0.001:
+                        # Проверяем спред если доступны bid/ask
+                        bid = ticker.get('bid', 0)
+                        ask = ticker.get('ask', 0)
+                        if bid > 0 and ask > 0:
+                            spread_pct = ((ask - bid) / bid) * 100
+                            if spread_pct <= 3.0:  # Спред не больше 3%
+                                usdt_perp[symbol] = ticker
+                        else:
+                            # Если нет данных о спреде, включаем по объему и цене
+                            usdt_perp[symbol] = ticker
             
             # Сортировка по объему
             sorted_symbols = sorted(
@@ -337,7 +354,7 @@ class ExchangeManager:
             # Топ N
             top_symbols = [symbol for symbol, _ in sorted_symbols[:top_n]]
             
-            logger.info(f"📊 Топ {len(top_symbols)} символов по объему")
+            logger.info(f"📊 Топ {len(top_symbols)} ликвидных символов по объему (из {len(tickers)} всего)")
             return top_symbols
             
         except Exception as e:
