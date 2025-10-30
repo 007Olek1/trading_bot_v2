@@ -264,6 +264,19 @@ class TelegramCommandsHandler:
             total_pnl = self.bot.performance_stats.get('total_pnl', 0.0)
             
             win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
+
+            # Определяем актуальный адаптивный порог уверенности (65–85%)
+            adaptive_conf = None
+            try:
+                getter = getattr(self.bot, 'get_adaptive_min_confidence', None)
+                if callable(getter):
+                    adaptive_conf = getter()
+            except Exception:
+                adaptive_conf = None
+            if adaptive_conf is None:
+                adaptive_conf = getattr(self.bot, 'ADAPTIVE_MIN_CONFIDENCE', None)
+            if adaptive_conf is None:
+                adaptive_conf = getattr(self.bot, 'MIN_CONFIDENCE', 70)
             
             message = f"""📊 *СТАТУС БОТА*
 
@@ -279,7 +292,7 @@ class TelegramCommandsHandler:
 ⚙️ *Настройки:*
 🎚 *Леверидж:* {self.bot.LEVERAGE}x
 💸 *Размер сделки:* {self.bot.POSITION_SIZE} USDT
-🎲 *Порог уверенности:* {self.bot.MIN_CONFIDENCE}%
+🎲 *Порог уверенности:* {adaptive_conf}% (адаптивно)
 
 ⏰ {datetime.now(self.warsaw_tz).strftime('%H:%M:%S %d.%m.%Y')}
 """
