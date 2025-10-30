@@ -139,17 +139,21 @@ class AdvancedMLSystem:
             macd_values = technical_indicators['macd']
             macd_signal_values = technical_indicators['macd_signal']
             
-            # Преобразуем в pandas Series если это numpy array
-            if isinstance(macd_values, np.ndarray):
-                macd_series = pd.Series(macd_values, index=ohlcv_data.index)
-                macd_signal_series = pd.Series(macd_signal_values, index=ohlcv_data.index)
-            else:
-                macd_series = macd_values
-                macd_signal_series = macd_signal_values
+            # Преобразуем к pandas Series с индексом цены
+            def to_series(x):
+                if isinstance(x, pd.Series):
+                    return x.reindex(ohlcv_data.index)
+                if isinstance(x, np.ndarray) or isinstance(x, list):
+                    return pd.Series(x, index=ohlcv_data.index[:len(x)]).reindex(ohlcv_data.index)
+                # Скаляр: растянем по длине индекса
+                return pd.Series([x] * len(ohlcv_data), index=ohlcv_data.index)
+            
+            macd_series = to_series(macd_values)
+            macd_signal_series = to_series(macd_signal_values)
             
             features['macd_diff'] = macd_series - macd_signal_series
-            features['macd_cross'] = ((macd_series > macd_signal_series) & 
-                                     (macd_series.shift(1) <= macd_signal_series.shift(1))).astype(int)
+            features['macd_cross'] = ((macd_series > macd_signal_series) &
+                                      (macd_series.shift(1) <= macd_signal_series.shift(1))).astype(int)
         
         # Временные признаки
         features['hour_of_day'] = pd.to_datetime(ohlcv_data.index).hour
