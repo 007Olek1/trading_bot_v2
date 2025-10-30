@@ -1393,24 +1393,22 @@ class SuperBotV4MTF:
             except Exception:
                 pass
             
-            # 🔒 Требуем подтверждение 45m + 1h + 4h по направлению, 15m/30m используем как тайминговые триггеры
+            # 🔒 Жёсткий фильтр: подтверждение 1h + 4h по направлению; 45m/15m/30m используем как тайминг
             def _mtf_confirm(dir_: str) -> bool:
                 if dir_ == 'buy':
-                    c45 = current_45m.get('ema_9', 0) > current_45m.get('ema_21', 0)
                     c1h = current_1h.get('ema_9', 0) > current_1h.get('ema_21', 0)
                     c4h = current_4h.get('ema_9', 0) > current_4h.get('ema_21', 0)
-                    logger.debug(f"✅ MTF {symbol} LONG check 45m={c45} 1h={c1h} 4h={c4h}")
-                    return c45 and c1h and c4h
+                    logger.debug(f"✅ MTF {symbol} LONG check 1h={c1h} 4h={c4h}")
+                    return c1h and c4h
                 if dir_ == 'sell':
-                    c45 = current_45m.get('ema_9', 0) < current_45m.get('ema_21', 0)
                     c1h = current_1h.get('ema_9', 0) < current_1h.get('ema_21', 0)
                     c4h = current_4h.get('ema_9', 0) < current_4h.get('ema_21', 0)
-                    logger.debug(f"✅ MTF {symbol} SHORT check 45m={c45} 1h={c1h} 4h={c4h}")
-                    return c45 and c1h and c4h
+                    logger.debug(f"✅ MTF {symbol} SHORT check 1h={c1h} 4h={c4h}")
+                    return c1h and c4h
                 return False
 
             if signal and not _mtf_confirm(signal):
-                logger.info(f"🚫 {symbol}: Отклонено из-за отсутствия подтверждения 45m+1h+4h для {signal.upper()}")
+                logger.info(f"🚫 {symbol}: Отклонено — нет подтверждения 1h+4h для {signal.upper()}")
                 signal = None
 
             # ДОП. ФИЛЬТРЫ ДЛЯ НОВЫХ СДЕЛОК: требуем реальный потенциал для +1%
