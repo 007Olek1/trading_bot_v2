@@ -844,6 +844,16 @@ class SuperBotV4MTF:
                         ohlcv = await self.exchange.fetch_ohlcv(normalized_symbol, timeframe, limit=limit)
                 else:
                     ohlcv = await self.exchange.fetch_ohlcv(normalized_symbol, timeframe, limit=limit)
+                # Bybit v5 иногда возвращает пустые свечи для '45m'; добавляем безопасный фолбэк через pybit interval=45
+                if (not ohlcv or len(ohlcv) == 0) and timeframe == '45m':
+                    try:
+                        from pybit.unified_trading import HTTP
+                        session = HTTP(api_key=self.api_key, api_secret=self.api_secret, testnet=False, recv_window=5000, timeout=10)
+                        k = session.get_kline(category='linear', symbol=normalized_symbol, interval=45, limit=min(200, max(100, limit)))
+                        lst = (k.get('result', {}) or {}).get('list', []) or []
+                        ohlcv = [[int(x[0]), float(x[1]), float(x[2]), float(x[3]), float(x[4]), float(x[5])] for x in lst]
+                    except Exception as _:
+                        pass
                 if ohlcv:
                     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
