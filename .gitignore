@@ -1,0 +1,28 @@
+# Secrets
+.env
+api.env
+*.env
+
+# Logs
+logs/
+**/logs/
+*.log
+
+# Caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Data and models
+data/
+models/
+*.db
+*.sqlite
+
+# Systemd units backup
+*.service
+*.timer
+
+# OS files
+.DS_Store
