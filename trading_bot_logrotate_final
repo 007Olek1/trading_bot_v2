@@ -1,0 +1,108 @@
+# Ротация логов торгового бота
+# Основные логи бота
+/opt/bot/logs/system/bot.log {
+    daily
+    rotate 3
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0644 root root
+    copytruncate
+    maxsize 500M
+}
+
+/opt/bot/logs/system/bot_error.log {
+    daily
+    rotate 3
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0644 root root
+    copytruncate
+    maxsize 500M
+}
+
+# Другие логи в system (исключая bot.log и bot_error.log)
+/opt/bot/logs/system/health_check_*.log {
+    daily
+    rotate 2
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0644 root root
+    copytruncate
+    maxsize 10M
+}
+
+/opt/bot/logs/system/monitor_*.log {
+    daily
+    rotate 2
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0644 root root
+    copytruncate
+    maxsize 50M
+}
+
+# Логи в корне /opt/bot/logs
+/opt/bot/logs/bot.log {
+    daily
+    rotate 2
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0644 root root
+    copytruncate
+    maxsize 100M
+}
+
+/opt/bot/logs/bot_error.log {
+    daily
+    rotate 2
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0644 root root
+    copytruncate
+    maxsize 100M
+}
+
+# Логи в корне /opt/bot
+/opt/bot/super_bot_v4_mtf.log {
+    daily
+    rotate 2
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0644 root root
+    copytruncate
+    maxsize 100M
+}
+
+/opt/bot/super_expert_test.log {
+    daily
+    rotate 2
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0644 root root
+    copytruncate
+    maxsize 50M
+}
+
+
+
+
+
+
+
+

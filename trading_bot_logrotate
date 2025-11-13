@@ -1,0 +1,57 @@
+# Ротация логов торгового бота
+/opt/bot/logs/system/*.log {
+    daily
+    rotate 3
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0644 root root
+    copytruncate
+    maxsize 500M
+    sharedscripts
+    postrotate
+        # Перезапуск процессов бота не требуется благодаря copytruncate
+        # Проверяем что процессы еще работают
+        if [ -f /opt/bot/.bot_pid ]; then
+            pid=$(cat /opt/bot/.bot_pid)
+            if ps -p $pid > /dev/null 2>&1; then
+                # Процесс работает, логирование продолжится в новый файл
+                touch /opt/bot/logs/system/bot.log
+                touch /opt/bot/logs/system/bot_error.log
+            fi
+        fi
+    endscript
+}
+
+/opt/bot/logs/*.log {
+    daily
+    rotate 2
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0644 root root
+    copytruncate
+    maxsize 100M
+}
+
+/opt/bot/*.log {
+    daily
+    rotate 2
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0644 root root
+    copytruncate
+    maxsize 100M
+}
+
+
+
+
+
+
+
+
