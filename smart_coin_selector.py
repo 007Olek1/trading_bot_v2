@@ -232,7 +232,15 @@ class SmartCoinSelector:
             try:
                 # Загружаем markets если еще не загружены
                 if not hasattr(exchange, 'markets') or not exchange.markets:
-                    await exchange.load_markets()
+                    # Проверяем, является ли метод асинхронным
+                    if asyncio.iscoroutinefunction(exchange.load_markets):
+                        await exchange.load_markets()
+                    else:
+                        # Синхронный метод - вызываем в executor
+                        import concurrent.futures
+                        loop = asyncio.get_event_loop()
+                        with concurrent.futures.ThreadPoolExecutor() as executor:
+                            await loop.run_in_executor(executor, exchange.load_markets)
                 
                 # Получаем ТОЛЬКО линейные фьючерсы (linear) из markets
                 all_symbols = list(exchange.markets.keys())
@@ -250,48 +258,46 @@ class SmartCoinSelector:
                 
                 # Для Bybit используем правильный формат категории
                 # Пытаемся получить тикеры через правильный API метод
-                try:
-                    # Для Bybit v5 API используем правильные параметры
-                    if hasattr(exchange, 'api') and 'bybit' in exchange.id.lower():
-                        # Получаем топ символов по объему через правильный API endpoint
-                        # Используем метод бота для получения топ символов
-                        tickers_data = await exchange.fetch_tickers(params={'category': 'linear'})
-                        if tickers_data:
-                            tickers.update(tickers_data)
-                except Exception as e:
-                    logger.debug(f"⚠️ fetch_tickers с параметрами не сработал: {e}")
+                # НЕ используем fetch_tickers, т.к. ccxt может не поддерживать его корректно для Bybit v5
+                # Вместо этого формируем тикеры из markets и данных отдельных символов
+                pass  # Пропускаем fetch_tickers, используем индивидуальные запросы ниже
                 
                 # Если тикеров мало, получаем данные из markets и формируем тикеры
                 if len(tickers) < 50:
-                    logger.info(f"📊 Получаем данные из markets для {min(200, len(usdt_symbols))} символов...")
-                    for symbol in usdt_symbols[:200]:
+                    # Получаем больше символов для анализа (до 300)
+                    symbols_to_fetch = min(300, len(usdt_symbols))
+                    logger.info(f"📊 Получаем данные из markets для {symbols_to_fetch} символов...")
+                    for symbol in usdt_symbols[:symbols_to_fetch]:
                         try:
                             # Получаем тикер для конкретного символа (ТОЛЬКО фьючерсы)
-                            ticker = await exchange.fetch_ticker(symbol, params={'category': 'linear'})
-                            if ticker:
+                            # Проверяем, является ли метод асинхронным
+                            if asyncio.iscoroutinefunction(exchange.fetch_ticker):
+                                ticker = await exchange.fetch_ticker(symbol, params={'category': 'linear'})
+                            else:
+                                # Синхронный метод - вызываем в executor чтобы не блокировать event loop
+                                import concurrent.futures
+                                loop = asyncio.get_event_loop()
+                                with concurrent.futures.ThreadPoolExecutor() as executor:
+                                    ticker = await loop.run_in_executor(
+                                        executor,
+                                        lambda: exchange.fetch_ticker(symbol, params={'category': 'linear'})
+                                    )
+                            
+                            if ticker and isinstance(ticker, dict):
                                 tickers[symbol] = ticker
-                        except:
-                            # Если не получили тикер, используем базовую info из market
-                            if symbol in exchange.markets:
-                                market = exchange.markets[symbol]
-                                tickers[symbol] = {
-                                    'symbol': symbol,
-                                    'quoteVolume': market.get('info', {}).get('volume24h', 0) or 1000000,
-                                    'last': market.get('last', 0),
-                                    'percentage': market.get('percentage', 0),
-                                    'high': market.get('high', 0),
-                                    'low': market.get('low', 0),
-                                    'open': market.get('open', 0),
-                                    'close': market.get('close', 0)
-                                }
-                            
-                            # Ограничиваем количество запросов
-                            if len(tickers) >= 200:
-                                break
-                            
-                            # Небольшая пауза чтобы не перегрузить API
-                            if len(tickers) % 50 == 0:
-                                await asyncio.sleep(0.1)
+                        except Exception as e:
+                            # Если не получили тикер, пропускаем этот символ
+                            # НЕ создаем фейковые тикеры с объемом 1000000, это приводит к выбору мусорных монет
+                            logger.debug(f"⚠️ Не удалось получить тикер для {symbol}: {e}")
+                            pass
+                        
+                        # Ограничиваем количество запросов (увеличиваем лимит)
+                        if len(tickers) >= 300:
+                            break
+                        
+                        # Небольшая пауза чтобы не перегрузить API
+                        if len(tickers) % 50 == 0:
+                            await asyncio.sleep(0.1)
                     
                     logger.info(f"📊 Получено тикеров: {len(tickers)}")
                 
@@ -315,14 +321,55 @@ class SmartCoinSelector:
             # Применяем базовые фильтры
             filtered_pairs = self._apply_basic_filters(usdt_pairs)
             
-            if not filtered_pairs:
-                # Если после фильтров пусто, но сырые пары есть — возьмём топ по объёму без жёстких фильтров, чтобы обеспечить минимум 100-200 монет
+            # Если после фильтров недостаточно монет или пусто, дополняем топом по объему без жестких фильтров
+            target_count = self._get_target_count(market_condition)
+            if not filtered_pairs or len(filtered_pairs) < target_count * 0.5:
+                # Если после фильтров мало монет, дополняем топом по объему
                 if usdt_pairs:
-                    logger.warning("⚠️ После фильтрации пусто — выбираю топ по объёму без жёстких фильтров")
-                    target_count = self._get_target_count(market_condition)
-                    rough_sorted = sorted(usdt_pairs, key=lambda x: x[1].get('quoteVolume', 0) or 0, reverse=True)
-                    symbols = [pair[0] for pair in rough_sorted[:target_count]]
-                    logger.info(f"🎯 Выбран rough-топ: {len(symbols)} монет (мин-гар.)")
+                    logger.warning(f"⚠️ После фильтрации мало монет ({len(filtered_pairs) if filtered_pairs else 0}), дополняю топом по объему без жёстких фильтров")
+                    # Берем топ по объему без дополнительных фильтров (только минимальный объем для безопасности)
+                    rough_sorted = sorted(
+                        usdt_pairs, 
+                        key=lambda x: float(x[1].get('quoteVolume', 0) or 0), 
+                        reverse=True
+                    )
+                    # Применяем только минимальный фильтр объема (более мягкий)
+                    min_safe_volume = self.min_volume_24h * 0.5  # Половина от стандартного минимума
+                    rough_filtered = [
+                        (symbol, ticker) for symbol, ticker in rough_sorted
+                        if float(ticker.get('quoteVolume', 0) or 0) >= min_safe_volume
+                    ]
+                    
+                    # Объединяем отфильтрованные и rough, убирая дубликаты
+                    combined_pairs = []
+                    seen_symbols = set()
+                    
+                    # Сначала добавляем качественно отфильтрованные
+                    if filtered_pairs:
+                        for pair in filtered_pairs:
+                            if pair[0] not in seen_symbols:
+                                combined_pairs.append(pair)
+                                seen_symbols.add(pair[0])
+                    
+                    # Дополняем rough до целевого количества
+                    for pair in rough_filtered:
+                        if len(combined_pairs) >= target_count:
+                            break
+                        if pair[0] not in seen_symbols:
+                            combined_pairs.append(pair)
+                            seen_symbols.add(pair[0])
+                    
+                    # Если все еще мало, берем просто топ без фильтров (только объем > 0)
+                    if len(combined_pairs) < target_count * 0.7:
+                        for pair in rough_sorted:
+                            if len(combined_pairs) >= target_count:
+                                break
+                            if pair[0] not in seen_symbols and float(pair[1].get('quoteVolume', 0) or 0) > 0:
+                                combined_pairs.append(pair)
+                                seen_symbols.add(pair[0])
+                    
+                    symbols = [pair[0] for pair in combined_pairs[:target_count]]
+                    logger.info(f"🎯 Выбран комбинированный список: {len(symbols)} монет (фильтр + топ)")
                     return symbols
                 logger.warning("⚠️ После фильтрации монет не осталось, используем fallback")
                 return await self._get_fallback_symbols(exchange)
@@ -338,10 +385,39 @@ class SmartCoinSelector:
             
             symbols = [pair[0] for pair in selected_pairs]
             
-            logger.info(f"🎯 Умный селектор отобрал {len(symbols)} монет из {len(usdt_pairs)} доступных")
-            logger.info(f"📊 Топ-5 по объему: {', '.join(symbols[:5])}")
+            # ✅ ГАРАНТИРУЕМ что топ-50 приоритетных монет ВСЕГДА в списке
+            priority_top50 = [
+                'BTCUSDT','ETHUSDT','BNBUSDT','SOLUSDT','XRPUSDT','ADAUSDT','AVAXUSDT','LINKUSDT','DOTUSDT','LTCUSDT',
+                'ATOMUSDT','ETCUSDT','XLMUSDT','NEARUSDT','ICPUSDT','FILUSDT','APTUSDT','ARBUSDT','OPUSDT','SUIUSDT',
+                'TIAUSDT','SEIUSDT','TRXUSDT','TONUSDT','AAVEUSDT','UNIUSDT','HBARUSDT','BCHUSDT','MATICUSDT','INJUSDT',
+                'ALGOUSDT','VETUSDT','THETAUSDT','FTMUSDT','EGLDUSDT','AXSUSDT','SANDUSDT','MANAUSDT','GALAUSDT','ENJUSDT',
+                'DOGEUSDT','SHIBUSDT','PEPEUSDT','1000FLOKIUSDT','BONKUSDT','WIFUSDT','BOMEUSDT','MYROUSDT','POPCATUSDT','MEWUSDT'
+            ]
             
-            return symbols
+            # Добавляем приоритетные монеты в начало списка (если их еще нет)
+            final_symbols = []
+            seen_symbols = set()
+            
+            # Сначала добавляем топ-50 приоритетных
+            for priority_symbol in priority_top50:
+                if priority_symbol not in seen_symbols:
+                    final_symbols.append(priority_symbol)
+                    seen_symbols.add(priority_symbol)
+            
+            # Затем добавляем остальные выбранные монеты
+            for symbol in symbols:
+                if symbol not in seen_symbols:
+                    final_symbols.append(symbol)
+                    seen_symbols.add(symbol)
+            
+            # Обрезаем до целевого количества
+            final_symbols = final_symbols[:target_count]
+            
+            logger.info(f"🎯 Умный селектор отобрал {len(final_symbols)} монет из {len(usdt_pairs)} доступных")
+            logger.info(f"📊 Топ-10 по объему: {', '.join(final_symbols[:10])}")
+            logger.info(f"✅ Гарантированно включен топ-50 приоритетных монет")
+            
+            return final_symbols
             
         except Exception as e:
             logger.error(f"❌ Ошибка отбора монет: {e}", exc_info=True)
@@ -408,16 +484,17 @@ class SmartCoinSelector:
                     logger.debug(f"🚫 Исключен по Innovation Zone blacklist: {normalized_symbol}")
                     continue
                 
-                # Автодетекция по маркерам биржи (market/ticker info)
-                try:
-                    info_obj = ticker.get('info') or {}
-                    # объединяем ключи и значения в одну строку
-                    blob = ' '.join(list(info_obj.keys()) + [str(v) for v in info_obj.values()]).lower()
-                    if any(mrk in blob for mrk in self.innovation_markers):
-                        logger.debug(f"🚫 Исключен по маркерам биржи (Innovation/Risk): {normalized_symbol}")
-                        continue
-                except Exception:
-                    pass
+                # Автодетекция по маркерам биржи (market/ticker info) - ОТКЛЮЧЕНО
+                # Слишком строгий фильтр - отсекает все монеты
+                # Используем только явный blacklist
+                # try:
+                #     info_obj = ticker.get('info') or {}
+                #     blob = ' '.join(list(info_obj.keys()) + [str(v) for v in info_obj.values()]).lower()
+                #     if any(mrk in blob for mrk in self.innovation_markers):
+                #         logger.debug(f"🚫 Исключен по маркерам биржи (Innovation/Risk): {normalized_symbol}")
+                #         continue
+                # except Exception:
+                #     pass
                 
                 # Проверяем объем
                 volume_24h = ticker.get('quoteVolume', 0)
@@ -478,9 +555,9 @@ class SmartCoinSelector:
         
         base_counts = {
             'bull': 200,      # Бычий рынок - больше монет
-            'bear': 100,      # Медвежий рынок - меньше монет
-            'volatile': 150,  # Волатильный рынок - среднее количество
-            'normal': 145     # Обычные условия - 145 монет!
+            'bear': 150,      # Медвежий рынок - минимум 150 монет
+            'volatile': 175,  # Волатильный рынок - среднее количество
+            'normal': 150     # Обычные условия - 150 монет (топ-50 + еще 100 динамических)
         }
         
         count = base_counts.get(condition, 145)
@@ -497,29 +574,64 @@ class SmartCoinSelector:
                 for k, m in exchange.markets.items():
                     try:
                         if (m.get('linear') or m.get('type')=='linear') and ('USDT' in k):
-                            sym = k.replace('/', '')
-                            if sym.endswith(':USDT'):
-                                sym = sym[:-5] + 'USDT'
+                            sym = k.replace('/', '').replace('-', '').upper()
+                            # Убираем двоеточие и нормализуем
+                            if ':' in sym:
+                                base_part = sym.split(':', 1)[0]
+                                sym = (base_part if base_part.endswith('USDT') else base_part + 'USDT')
+                            # Убеждаемся что заканчивается на USDT (но не добавляем если уже есть)
+                            if not sym.endswith('USDT'):
+                                sym = sym + 'USDT'
+                            # Убираем дублирование USDT
+                            while sym.endswith('USDTUSDT'):
+                                sym = sym[:-4]
                             vol = m.get('info', {}).get('volume24h', 0) or 0
                             items.append((sym, float(vol)))
                     except Exception:
                         continue
-                items = sorted(items, key=lambda x: x[1], reverse=True)
-                symbols = [s for s,_ in items[:target_count]]
+                # Фильтруем монеты с нулевым или очень маленьким объемом
+                filtered_items = [(s, v) for s, v in items if v >= 100000]  # Минимум $100K
+                filtered_items = sorted(filtered_items, key=lambda x: x[1], reverse=True)
+                symbols = [s for s,_ in filtered_items[:target_count]]
                 if symbols:
-                    logger.warning(f"⚠️ Использую динамический fallback из markets: {len(symbols)} монет")
+                    logger.warning(f"⚠️ Использую динамический fallback из markets: {len(symbols)} монет (отфильтровано по объему >= $100K)")
+                    logger.info(f"📊 Топ-10 fallback: {symbols[:10]}")
                     return symbols
         except Exception:
             pass
-        # Статический резерв на крайний случай (≈145 не гарантируем, но покроем основные)
-        fallback_symbols = [
+        # Статический резерв на крайний случай - ТОП-50 + расширение до 100-200
+        # Сначала гарантируем топ-50 приоритетных монет
+        priority_top50 = [
+            # Топ-20 по капитализации и объему (крупнейшие)
             'BTCUSDT','ETHUSDT','BNBUSDT','SOLUSDT','XRPUSDT','ADAUSDT','AVAXUSDT','LINKUSDT','DOTUSDT','LTCUSDT',
             'ATOMUSDT','ETCUSDT','XLMUSDT','NEARUSDT','ICPUSDT','FILUSDT','APTUSDT','ARBUSDT','OPUSDT','SUIUSDT',
-            'TIAUSDT','SEIUSDT','DOGEUSDT','SHIBUSDT','PEPEUSDT','1000FLOKIUSDT','BONKUSDT','WIFUSDT','BOMEUSDT','MYROUSDT',
-            'POPCATUSDT','MEWUSDT','TRXUSDT','TONUSDT','AAVEUSDT','AAVEUSDT','HBARUSDT','BCHUSDT','AAVEUSDT','UNIUSDT'
+            # Топ-40 популярные альткоины (средняя капитализация)
+            'TIAUSDT','SEIUSDT','TRXUSDT','TONUSDT','AAVEUSDT','UNIUSDT','HBARUSDT','BCHUSDT','MATICUSDT','INJUSDT',
+            'ALGOUSDT','VETUSDT','THETAUSDT','FTMUSDT','EGLDUSDT','AXSUSDT','SANDUSDT','MANAUSDT','GALAUSDT','ENJUSDT',
+            # Топ-50 мемкоины и популярные токены (высокая волатильность)
+            'DOGEUSDT','SHIBUSDT','PEPEUSDT','1000FLOKIUSDT','BONKUSDT','WIFUSDT','BOMEUSDT','MYROUSDT','POPCATUSDT','MEWUSDT'
         ]
-        logger.warning(f"⚠️ Использую статический fallback: {len(fallback_symbols)} монет")
-        return list(dict.fromkeys(fallback_symbols))
+        
+        # Дополняем до целевого количества (100-200) дополнительными популярными монетами
+        additional_symbols = [
+            'FETUSDT','AGIXUSDT','RNDRUSDT','IMXUSDT','GRTUSDT','MKRUSDT','SNXUSDT','CRVUSDT','COMPUSDT','ZRXUSDT',
+            'ZECUSDT','DASHUSDT','XTZUSDT','EOSUSDT','IOTAUSDT','WAVESUSDT','RUNEUSDT','KAVAUSDT','ROSEUSDT','STORJUSDT',
+            'ONTUSDT','ZILUSDT','BANDUSDT','OMGUSDT','REEFUSDT','CHZUSDT','FLOWUSDT','KLAYUSDT','SKLUSDT','COTIUSDT',
+            'OCEANUSDT','SFPUSDT','BELUSDT','CTKUSDT','LITUSDT','CHRUSDT','PERPUSDT','RLCUSDT','YFIUSDT','SUSHIUSDT',
+            '1INCHUSDT','LUNAUSDT','NEARUSDT','WLDUSDT','BLURUSDT','JTOUSDT','ORCAUSDT','JUPUSDT','PYTHUSDT','WENUSDT',
+            'ZEROUSDT','PIXELUSDT','PORTALUSDT','PENGUUSDT','GMUSDT','NOTUSDT','IOUSDT','AIUSDT','BBUSDT','ONDOUSDT',
+            'ZROUSDT','LISTAUSDT','TONNELUSDT','MODEUSDT','TAOUSDT','BONKUSDT','WIFUSDT','FLOKIUSDT','PEPEUSDT','SHIBUSDT'
+        ]
+        
+        # Получаем целевое количество для нормального рынка
+        target_count = self._get_target_count('normal')
+        
+        # Объединяем приоритетные + дополнительные до целевого количества
+        all_fallback = priority_top50 + additional_symbols
+        unique_fallback = list(dict.fromkeys(all_fallback))[:target_count]
+        
+        logger.warning(f"⚠️ Использую статический fallback: {len(unique_fallback)} монет (ТОП-50 гарантирован + расширение до {target_count})")
+        return unique_fallback
     
     def analyze_market_condition(self, btc_change: float, market_trend: str) -> str:
         """
