@@ -94,3 +94,5 @@ sl = entry * (1 + risk_pct) if side == 'Sell' else entry * (1 - risk_pct)
 
 
 
+
+

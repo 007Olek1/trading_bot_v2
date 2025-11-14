@@ -27,3 +27,5 @@ crontab -l | grep -E "(auto_cleanup|cleanup)" || echo "   (не найдено)"
 
 
 
+
+

@@ -178,8 +178,32 @@ def round_price(price: float, tick_size: float = 0.01) -> float:
 
 
 def round_quantity(quantity: float, qty_step: float = 0.001) -> float:
-    """Округление количества до qty step биржи"""
-    return round(quantity / qty_step) * qty_step
+    """
+    Округление количества до qty step биржи
+    Убирает лишние знаки после запятой
+    """
+    if qty_step <= 0:
+        qty_step = 0.001
+    
+    # Округляем до нужного шага
+    rounded = round(quantity / qty_step) * qty_step
+    
+    # Определяем количество знаков после запятой на основе qty_step
+    # Например: 0.001 -> 3 знака, 0.01 -> 2 знака, 1 -> 0 знаков
+    if qty_step >= 1:
+        decimals = 0
+    else:
+        # Считаем количество знаков после запятой
+        qty_str = str(qty_step).rstrip('0')
+        if '.' in qty_str:
+            decimals = len(qty_str.split('.')[1])
+        else:
+            decimals = 0
+    
+    # Округляем до нужного количества знаков и убираем лишние нули
+    rounded = round(rounded, decimals)
+    
+    return rounded
 
 
 print("✅ Утилиты Disco57 загружены")

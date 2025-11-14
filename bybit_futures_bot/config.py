@@ -56,7 +56,7 @@ TIMEFRAMES = {
     "1d": "1d",
 }
 PRIMARY_TIMEFRAME = "30m"  # Основной таймфрейм для сигналов
-MIN_TIMEFRAME_ALIGNMENT = 2  # Минимум 2 таймфрейма должны подтверждать сигнал
+MIN_TIMEFRAME_ALIGNMENT = 1  # Минимум 1 таймфрейм должен подтверждать сигнал (оптимизировано)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -76,8 +76,8 @@ WATCHLIST = [
     "FILUSDT", "ICPUSDT", "TRXUSDT", "TONUSDT", "HBARUSDT",
     "VETUSDT", "ALGOUSDT", "SANDUSDT", "MANAUSDT", "AXSUSDT",
     
-    # Мемкоины (высокая волатильность)
-    "DOGEUSDT", "SHIBUSDT", "PEPEUSDT", "WIFUSDT", "BONKUSDT",
+    # Мемкоины (высокая волатильность) - убрал несуществующие на фьючерсах
+    "DOGEUSDT", "WIFUSDT",  # SHIBUSDT, PEPEUSDT, BONKUSDT не существуют на Bybit фьючерсах
     
     # Дополнительные ликвидные
     "BCHUSDT", "ETCUSDT", "LDOUSDT", "IMXUSDT", "GRTUSDT",
@@ -129,10 +129,10 @@ INDICATOR_PARAMS = {
 # ПОРОГИ СИГНАЛОВ
 # ═══════════════════════════════════════════════════════════════════
 SIGNAL_THRESHOLDS = {
-    "min_confidence": 0.70,  # Минимальная уверенность для входа (70%)
-    "strong_confidence": 0.85,  # Сильный сигнал (85%)
-    "min_volume_ratio": 1.2,  # Минимальное отношение объема к среднему
-    "max_spread_percent": 0.5,  # Максимальный спред в %
+    "min_confidence": 0.25,  # Минимальная уверенность для входа (25% - оптимизировано для прибыльности)
+    "strong_confidence": 0.50,  # Сильный сигнал (50%)
+    "min_volume_ratio": 1.1,  # Минимальное отношение объема к среднему (снижено)
+    "max_spread_percent": 1.0,  # Максимальный спред в % (увеличено)
 }
 
 
