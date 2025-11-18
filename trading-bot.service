@@ -1,0 +1,17 @@
+[Unit]
+Description=Trading Bot V4.0 MTF (Super Bot)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/trading_bot_v4_mtf
+Environment="PATH=/root/trading_bot_v4_mtf/venv/bin"
+ExecStart=/root/trading_bot_v4_mtf/venv/bin/python main.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

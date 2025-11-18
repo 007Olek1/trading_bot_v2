@@ -1,0 +1,857 @@
+"""
+🚀 TRADING BOT V4.0 MTF - ГЛАВНЫЙ МОДУЛЬ
+Super Bot с Multi-Timeframe анализом и продвинутыми стратегиями
+"""
+
+import asyncio
+import time
+from datetime import datetime, timezone, timedelta
+from typing import Dict, List, Optional, Tuple
+import logging
+
+from pybit.unified_trading import HTTP
+import pandas as pd
+import numpy as np
+
+import config
+from utils import (
+    setup_logging,
+    save_trade_log,
+    calculate_position_size,
+    calculate_multi_tp_levels,
+    calculate_trailing_sl,
+    format_telegram_message,
+    round_price,
+    round_quantity,
+)
+from indicators import MarketIndicators
+from strategies import (
+    TrendVolumeStrategy,
+    ManipulationDetector,
+    GlobalTrendAnalyzer
+)
+from telegram_handler import TelegramHandler
+from market_scanner import MarketScanner
+from fee_calculator import FeeCalculator
+from daily_reporter import DailyReporter
+
+
+class TradingBotV4MTF:
+    """Главный класс Trading Bot V4.0 MTF (Super Bot)"""
+    
+    def __init__(self):
+        """Инициализация бота"""
+        self.logger = setup_logging(config.LOG_FILE, config.LOG_LEVEL)
+        self.logger.info("="*80)
+        self.logger.info("🚀 TRADING BOT V4.0 MTF - SUPER BOT - ИНИЦИАЛИЗАЦИЯ")
+        self.logger.info("="*80)
+        
+        # Bybit API клиент
+        self.client = HTTP(
+            testnet=config.USE_TESTNET,
+            api_key=config.BYBIT_API_KEY,
+            api_secret=config.BYBIT_API_SECRET,
+        )
+        
+        # Индикаторы и стратегии
+        self.indicators = MarketIndicators(config.INDICATOR_PARAMS)
+        self.trend_volume_strategy = TrendVolumeStrategy(config.INDICATOR_PARAMS)
+        self.manipulation_detector = ManipulationDetector()
+        self.global_trend_analyzer = GlobalTrendAnalyzer()
+        
+        # Сканер рынка и калькуляторы
+        self.market_scanner = MarketScanner(self.client, self.logger)
+        self.fee_calculator = FeeCalculator()
+        self.daily_reporter = DailyReporter(config.TRADES_LOG_FILE)
+        
+        # Telegram
+        self.telegram = TelegramHandler(
+            config.TELEGRAM_TOKEN,
+            config.TELEGRAM_CHAT_ID
+        )
+        self.telegram.set_bot_instance(self)
+        
+        # Состояние
+        self.active = True
+        self.open_positions: Dict[str, Dict] = {}  # {symbol: position_info}
+        self.last_analysis_time = None
+        self.last_watchlist_update = None
+        self.current_watchlist = []
+        self.cycle_count = 0
+        self.last_daily_report = None
+        
+        self._log_startup_info()
+    
+    def _log_startup_info(self):
+        """Логирование информации при запуске"""
+        self.logger.info(f"📊 MTF Таймфреймы: {' ⏩ '.join(config.TIMEFRAMES.keys())}")
+        self.logger.info(f"🎯 Стратегии:")
+        for name, params in config.STRATEGIES.items():
+            if params['enabled']:
+                self.logger.info(f"  ✅ {params['description']} (вес: {params['weight']*100}%)")
+        self.logger.info(f"💰 Баланс проверяется при старте...")
+        self.logger.info(f"⚡ Сделка: ${config.POSITION_SIZE_USD} x{config.LEVERAGE} = ${config.POSITION_SIZE_USD * config.LEVERAGE}")
+        self.logger.info(f"📌 Макс. позиций: {config.MAX_CONCURRENT_POSITIONS}")
+        self.logger.info(f"🎯 Минимальная цель: +{config.MIN_PROFIT_TARGET_PERCENT}%")
+        self.logger.info(f"🔄 Trailing SL: активен сразу, откат {config.TRAILING_SL_CALLBACK_PERCENT}%")
+        self.logger.info(f"📈 Держим до разворота (trailing закроет)")
+        self.logger.info(f"🛑 SL макс: ${config.STOP_LOSS_MAX_USD}")
+        self.logger.info(f"⏱️ Анализ: каждые {config.ANALYSIS_INTERVAL_SECONDS//60} мин")
+        self.logger.info(f"📊 Мониторинг: каждую {config.MONITORING_INTERVAL_SECONDS//60} минуту")
+    
+    # ═══════════════════════════════════════════════════════════════════
+    # ДИНАМИЧЕСКОЕ СКАНИРОВАНИЕ
+    # ═══════════════════════════════════════════════════════════════════
+    
+    def update_watchlist(self):
+        """Обновление списка монет для сканирования"""
+        from datetime import datetime, timedelta
+        
+        # Проверяем нужно ли обновлять
+        if self.last_watchlist_update:
+            time_since_update = datetime.now() - self.last_watchlist_update
+            if time_since_update < timedelta(hours=config.UPDATE_WATCHLIST_HOURS):
+                return self.current_watchlist
+        
+        if config.USE_DYNAMIC_SCANNER:
+            self.logger.info("🔍 Обновление списка ликвидных монет...")
+            self.current_watchlist = self.market_scanner.get_liquid_symbols(
+                min_volume_24h=config.MIN_VOLUME_24H_USD,
+                limit=config.MAX_SYMBOLS_TO_SCAN
+            )
+            self.last_watchlist_update = datetime.now()
+            self.logger.info(f"✅ Watchlist обновлён: {len(self.current_watchlist)} монет")
+        else:
+            self.current_watchlist = config.WATCHLIST
+        
+        return self.current_watchlist
+    
+    # ═══════════════════════════════════════════════════════════════════
+    # ПОЛУЧЕНИЕ ДАННЫХ
+    # ═══════════════════════════════════════════════════════════════════
+    
+    def get_klines(self, symbol: str, interval: str, limit: int = 200) -> Optional[pd.DataFrame]:
+        """Получение свечей с биржи"""
+        try:
+            self.logger.debug(f"Запрос данных: {symbol} {interval}")
+            
+            response = self.client.get_kline(
+                category="linear",
+                symbol=symbol,
+                interval=interval,
+                limit=limit
+            )
+            
+            if response['retCode'] != 0:
+                error_msg = response.get('retMsg', 'Unknown error')
+                # Тихо игнорируем невалидные символы (это норма для некоторых пар)
+                if 'Symbol Is Invalid' not in error_msg and '10001' not in str(response.get('retCode', '')):
+                    self.logger.warning(f"Ошибка получения данных для {symbol} {interval}: {error_msg}")
+                return None
+            
+            klines = response['result']['list']
+            
+            if not klines:
+                self.logger.warning(f"Пустой список свечей для {symbol} {interval}")
+                return None
+            
+            # Создаём DataFrame
+            df = pd.DataFrame(klines, columns=[
+                'timestamp', 'open', 'high', 'low', 'close', 'volume', 'turnover'
+            ])
+            
+            # Конвертируем типы
+            df['timestamp'] = pd.to_datetime(df['timestamp'].astype(int), unit='ms')
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                df[col] = df[col].astype(float)
+            
+            # Сортируем по времени (от старых к новым)
+            df = df.sort_values('timestamp').reset_index(drop=True)
+            
+            return df
+            
+        except Exception as e:
+            # Не логируем ошибки для невалидных символов (это норма)
+            error_str = str(e)
+            if 'Symbol Is Invalid' not in error_str and '10001' not in error_str:
+                self.logger.error(f"Ошибка get_klines для {symbol} {interval}: {e}")
+            return None
+    
+    def get_mtf_data(self, symbol: str) -> Dict[str, pd.DataFrame]:
+        """Получение данных по всем таймфреймам"""
+        mtf_data = {}
+        
+        for tf_name, tf_value in config.TIMEFRAMES.items():
+            df = self.get_klines(symbol, tf_value, limit=200)
+            if df is not None and len(df) > 0:
+                mtf_data[tf_name] = df
+        
+        return mtf_data
+    
+    # ═══════════════════════════════════════════════════════════════════
+    # MTF АНАЛИЗ
+    # ═══════════════════════════════════════════════════════════════════
+    
+    def analyze_mtf_signal(self, symbol: str, mtf_data: Dict[str, pd.DataFrame]) -> Optional[Dict]:
+        """
+        Анализ сигнала по всем таймфреймам
+        Возвращает: {'direction': 'LONG'/'SHORT', 'confidence': 0.0-1.0, 'details': {...}}
+        """
+        if not mtf_data or len(mtf_data) < config.MIN_TIMEFRAME_ALIGNMENT:
+            return None
+        
+        signals = {}
+        
+        # Анализ каждого таймфрейма
+        for tf_name, df in mtf_data.items():
+            if len(df) < 50:  # Недостаточно данных
+                continue
+            
+            # Рассчитываем индикаторы
+            indicators = self.indicators.calculate_all(df)
+            
+            # Применяем стратегии
+            strategy_signals = {}
+            
+            # 1. Тренд + Объём + Bollinger
+            if config.STRATEGIES['trend_volume_bb']['enabled']:
+                trend_signal = self.trend_volume_strategy.analyze(df, indicators)
+                strategy_signals['trend_volume_bb'] = trend_signal
+            
+            # 2. Детектор манипуляций
+            if config.STRATEGIES['manipulation_detector']['enabled']:
+                manip_signal = self.manipulation_detector.analyze(df, indicators)
+                strategy_signals['manipulation_detector'] = manip_signal
+            
+            # 3. Глобальный тренд (только для 4h и 1d)
+            if config.STRATEGIES['global_trend']['enabled'] and tf_name in ['4h', '1d']:
+                global_signal = self.global_trend_analyzer.analyze(df, indicators)
+                strategy_signals['global_trend'] = global_signal
+            
+            # Объединяем сигналы стратегий
+            tf_signal = self._combine_strategy_signals(strategy_signals)
+            signals[tf_name] = tf_signal
+        
+        # Объединяем сигналы всех таймфреймов
+        final_signal = self._combine_mtf_signals(signals)
+        
+        # Детальное логирование
+        if final_signal:
+            tf_count = final_signal.get('timeframes_aligned', 0)
+            confidence = final_signal.get('confidence', 0.0)
+            direction = final_signal.get('direction', 'NONE')
+            
+            # Проверяем условия
+            if confidence < config.SIGNAL_THRESHOLDS['min_confidence']:
+                self.logger.debug(
+                    f"  {symbol}: {direction} отклонён - "
+                    f"уверенность {confidence:.1%} < {config.SIGNAL_THRESHOLDS['min_confidence']:.1%}"
+                )
+                return None
+            
+            if tf_count < config.MIN_TIMEFRAME_ALIGNMENT:
+                self.logger.debug(
+                    f"  {symbol}: {direction} отклонён - "
+                    f"таймфреймов {tf_count}/{len(signals)} < {config.MIN_TIMEFRAME_ALIGNMENT}"
+                )
+                return None
+            
+            # Сигнал прошёл все проверки!
+            self.logger.info(
+                f"🎯 КАНДИДАТ: {symbol} {direction} | "
+                f"Уверенность: {confidence:.1%} | TF: {tf_count}/{len(signals)}"
+            )
+            
+            # Отправляем уведомление в Telegram о кандидате
+            try:
+                current_price = mtf_data[config.PRIMARY_TIMEFRAME]['close'].iloc[-1]
+                asyncio.create_task(
+                    self.telegram.send_candidate_alert(
+                        symbol=symbol,
+                        direction=direction,
+                        confidence=confidence,
+                        tf_aligned=tf_count,
+                        total_tf=len(signals),
+                        price=current_price
+                    )
+                )
+            except Exception as e:
+                self.logger.error(f"Ошибка отправки уведомления о кандидате: {e}")
+            
+            return final_signal
+        
+        return None
+    
+    def _combine_strategy_signals(self, strategy_signals: Dict) -> Dict:
+        """Объединение сигналов разных стратегий"""
+        if not strategy_signals:
+            return {'direction': None, 'confidence': 0.0}
+        
+        long_weight = 0.0
+        short_weight = 0.0
+        total_weight = 0.0
+        
+        for strategy_name, signal in strategy_signals.items():
+            if signal is None or signal['direction'] is None:
+                continue
+            
+            weight = config.STRATEGIES.get(strategy_name, {}).get('weight', 0.0)
+            confidence = signal.get('confidence', 0.0)
+            
+            if signal['direction'] == 'LONG':
+                long_weight += weight * confidence
+            elif signal['direction'] == 'SHORT':
+                short_weight += weight * confidence
+            
+            total_weight += weight
+        
+        if total_weight == 0:
+            return {'direction': None, 'confidence': 0.0}
+        
+        # Определяем направление
+        if long_weight > short_weight:
+            direction = 'LONG'
+            confidence = long_weight / total_weight
+        elif short_weight > long_weight:
+            direction = 'SHORT'
+            confidence = short_weight / total_weight
+        else:
+            direction = None
+            confidence = 0.0
+        
+        return {
+            'direction': direction,
+            'confidence': confidence,
+            'long_weight': long_weight,
+            'short_weight': short_weight
+        }
+    
+    def _combine_mtf_signals(self, signals: Dict[str, Dict]) -> Optional[Dict]:
+        """Объединение сигналов всех таймфреймов"""
+        if not signals:
+            return None
+        
+        # Подсчитываем голоса
+        long_votes = 0
+        short_votes = 0
+        total_confidence = 0.0
+        
+        for tf_name, signal in signals.items():
+            if signal['direction'] == 'LONG':
+                long_votes += 1
+                total_confidence += signal['confidence']
+            elif signal['direction'] == 'SHORT':
+                short_votes += 1
+                total_confidence += signal['confidence']
+        
+        total_votes = long_votes + short_votes
+        
+        if total_votes < config.MIN_TIMEFRAME_ALIGNMENT:
+            return None
+        
+        # Определяем направление
+        if long_votes > short_votes:
+            direction = 'LONG'
+            alignment = long_votes / len(signals)
+        elif short_votes > long_votes:
+            direction = 'SHORT'
+            alignment = short_votes / len(signals)
+        else:
+            return None  # Нет консенсуса
+        
+        # Средняя уверенность
+        avg_confidence = total_confidence / total_votes if total_votes > 0 else 0.0
+        
+        # Финальная уверенность с учётом выравнивания
+        final_confidence = avg_confidence * alignment
+        
+        return {
+            'direction': direction,
+            'confidence': final_confidence,
+            'timeframes_aligned': total_votes,
+            'total_timeframes': len(signals),
+            'alignment_ratio': alignment,
+            'details': signals
+        }
+    
+    # ═══════════════════════════════════════════════════════════════════
+    # ТОРГОВЛЯ
+    # ═══════════════════════════════════════════════════════════════════
+    
+    async def scan_and_trade(self):
+        """Сканирование рынка и открытие позиций"""
+        self.logger.info("🔍 Начинаю сканирование рынка...")
+        
+        # Проверяем лимит позиций
+        if len(self.open_positions) >= config.MAX_CONCURRENT_POSITIONS:
+            self.logger.info(f"⏸️ Достигнут лимит позиций: {len(self.open_positions)}/{config.MAX_CONCURRENT_POSITIONS}")
+            return
+        
+        # Обновляем watchlist
+        watchlist = self.update_watchlist()
+        
+        signals_found = []
+        
+        for symbol in watchlist:
+            # Пропускаем если уже есть позиция
+            if symbol in self.open_positions:
+                continue
+            
+            # Получаем MTF данные
+            mtf_data = self.get_mtf_data(symbol)
+            
+            if not mtf_data:
+                continue
+            
+            # Анализируем сигнал
+            signal = self.analyze_mtf_signal(symbol, mtf_data)
+            
+            if signal:
+                signals_found.append({
+                    'symbol': symbol,
+                    'signal': signal,
+                    'price': mtf_data[config.PRIMARY_TIMEFRAME]['close'].iloc[-1]
+                })
+        
+        # Сортируем по уверенности
+        signals_found.sort(key=lambda x: x['signal']['confidence'], reverse=True)
+        
+        # Открываем позиции
+        for sig in signals_found:
+            if len(self.open_positions) >= config.MAX_CONCURRENT_POSITIONS:
+                break
+            
+            await self.open_position(
+                symbol=sig['symbol'],
+                direction=sig['signal']['direction'],
+                confidence=sig['signal']['confidence'],
+                current_price=sig['price']
+            )
+        
+        if not signals_found:
+            self.logger.info("📭 Сигналов не найдено")
+    
+    async def open_position(self, symbol: str, direction: str, confidence: float, current_price: float):
+        """Открытие позиции"""
+        try:
+            self.logger.info(f"🎯 Открываю {direction} позицию: {symbol} (уверенность: {confidence:.1%})")
+            
+            # Рассчитываем размер позиции
+            quantity = calculate_position_size(
+                self.client,
+                symbol,
+                config.POSITION_SIZE_USD,
+                config.LEVERAGE,
+                current_price
+            )
+            
+            if quantity is None or quantity <= 0:
+                self.logger.error(f"❌ Не удалось рассчитать размер позиции для {symbol}")
+                return
+            
+            # Устанавливаем плечо
+            try:
+                self.client.set_leverage(
+                    category="linear",
+                    symbol=symbol,
+                    buyLeverage=str(config.LEVERAGE),
+                    sellLeverage=str(config.LEVERAGE)
+                )
+            except Exception as e:
+                self.logger.warning(f"⚠️ Не удалось установить плечо: {e}")
+            
+            # Открываем позицию
+            side = "Buy" if direction == "LONG" else "Sell"
+            
+            order = self.client.place_order(
+                category="linear",
+                symbol=symbol,
+                side=side,
+                orderType="Market",
+                qty=str(quantity),
+                timeInForce="GTC",
+                positionIdx=0,
+            )
+            
+            if order['retCode'] != 0:
+                self.logger.error(f"❌ Ошибка открытия позиции: {order.get('retMsg', 'Unknown')}")
+                return
+            
+            # Сохраняем информацию о позиции
+            self.open_positions[symbol] = {
+                'direction': direction,
+                'entry_price': current_price,
+                'quantity': quantity,
+                'initial_quantity': quantity,  # ИСХОДНОЕ количество для расчёта TP
+                'confidence': confidence,
+                'open_time': datetime.now(timezone.utc),
+                'tp_levels_hit': [],
+                'trailing_sl_active': False,
+                'order_id': order['result']['orderId']
+            }
+            
+            # Устанавливаем TP/SL
+            await self.set_tp_sl_levels(symbol)
+            
+            # Отправляем уведомление в Telegram
+            await self.telegram.send_position_opened(
+                symbol=symbol,
+                direction=direction,
+                entry_price=current_price,
+                quantity=quantity,
+                confidence=confidence
+            )
+            
+            self.logger.info(f"✅ Позиция открыта: {symbol} {direction} @ {current_price}")
+            
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка при открытии позиции {symbol}: {e}")
+    
+    async def set_tp_sl_levels(self, symbol: str):
+        """Установка начального SL"""
+        if symbol not in self.open_positions:
+            return
+        
+        pos = self.open_positions[symbol]
+        
+        # Рассчитываем начальный SL
+        sl_price = calculate_trailing_sl(
+            entry_price=pos['entry_price'],
+            direction=pos['direction'],
+            max_loss_usd=config.STOP_LOSS_MAX_USD,
+            position_size_usd=config.POSITION_SIZE_USD * config.LEVERAGE
+        )
+        
+        # Устанавливаем SL через API
+        try:
+            self.client.set_trading_stop(
+                category="linear",
+                symbol=symbol,
+                stopLoss=str(round_price(symbol, sl_price)),
+                positionIdx=0,
+            )
+            self.logger.info(f"🛑 Начальный SL установлен: {symbol} @ {sl_price:.6f} (макс. убыток: ${config.STOP_LOSS_MAX_USD})")
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка установки SL для {symbol}: {e}")
+        
+        # Сохраняем данные
+        pos['sl_price'] = sl_price
+        pos['max_profit_percent'] = 0.0
+        pos['trailing_sl_active'] = False
+    
+    async def monitor_positions(self):
+        """Мониторинг открытых позиций"""
+        if not self.open_positions:
+            return
+        
+        for symbol in list(self.open_positions.keys()):
+            await self.check_position(symbol)
+    
+    async def check_position(self, symbol: str):
+        """Проверка позиции и управление безубытком/trailing SL"""
+        if symbol not in self.open_positions:
+            return
+        
+        pos = self.open_positions[symbol]
+        
+        # Получаем текущую цену
+        mtf_data = self.get_mtf_data(symbol)
+        if not mtf_data or config.PRIMARY_TIMEFRAME not in mtf_data:
+            return
+        
+        current_price = mtf_data[config.PRIMARY_TIMEFRAME]['close'].iloc[-1]
+        
+        # Проверяем trailing SL (активен всегда, держим до разворота)
+        await self.check_trailing_sl(symbol, current_price)
+        
+        # Проверяем время удержания
+        await self.check_position_duration(symbol)
+    
+    async def check_trailing_sl(self, symbol: str, current_price: float):
+        """Проверка и обновление trailing SL (активен СРАЗУ с открытия)"""
+        if symbol not in self.open_positions:
+            return
+        
+        pos = self.open_positions[symbol]
+        
+        if not config.USE_TRAILING_SL:
+            return
+        
+        # Рассчитываем текущий PnL в процентах
+        if pos['direction'] == 'LONG':
+            pnl_percent = ((current_price - pos['entry_price']) / pos['entry_price']) * 100
+        else:  # SHORT
+            pnl_percent = ((pos['entry_price'] - current_price) / pos['entry_price']) * 100
+        
+        # Активируем trailing при достижении порога (0% = сразу)
+        if pnl_percent >= config.TRAILING_SL_ACTIVATION_PERCENT:
+            if not pos.get('trailing_sl_active', False):
+                pos['trailing_sl_active'] = True
+                self.logger.info(f"🔄 Trailing SL активирован для {symbol}")
+            
+            # Рассчитываем новый trailing SL
+            callback_percent = config.TRAILING_SL_CALLBACK_PERCENT / 100
+            
+            if pos['direction'] == 'LONG':
+                new_sl = current_price * (1 - callback_percent)
+            else:  # SHORT
+                new_sl = current_price * (1 + callback_percent)
+            
+            # Обновляем SL только если он лучше текущего
+            should_update = False
+            if pos['direction'] == 'LONG' and new_sl > pos['sl_price']:
+                should_update = True
+            elif pos['direction'] == 'SHORT' and new_sl < pos['sl_price']:
+                should_update = True
+            
+            if should_update:
+                try:
+                    self.client.set_trading_stop(
+                        category="linear",
+                        symbol=symbol,
+                        stopLoss=str(round_price(symbol, new_sl)),
+                        positionIdx=0,
+                    )
+                    
+                    old_sl = pos['sl_price']
+                    pos['sl_price'] = new_sl
+                    
+                    self.logger.info(
+                        f"🔄 Trailing SL обновлён: {symbol} | "
+                        f"Старый: {old_sl:.6f} → Новый: {new_sl:.6f}"
+                    )
+                    
+                except Exception as e:
+                    self.logger.error(f"❌ Ошибка обновления trailing SL для {symbol}: {e}")
+    
+    async def check_position_duration(self, symbol: str):
+        """Проверка времени удержания позиции"""
+        pos = self.open_positions[symbol]
+        duration = datetime.now(timezone.utc) - pos['open_time']
+        
+        if duration.total_seconds() > config.MAX_POSITION_DURATION_HOURS * 3600:
+            self.logger.warning(f"⏰ Позиция {symbol} открыта слишком долго, закрываю...")
+            await self.close_position(symbol, reason="max_duration")
+    
+    async def close_position(self, symbol: str, reason: str = "manual"):
+        """Закрытие позиции"""
+        if symbol not in self.open_positions:
+            return
+        
+        try:
+            pos = self.open_positions[symbol]
+            
+            # Закрываем позицию на бирже
+            side = "Sell" if pos['direction'] == "LONG" else "Buy"
+            
+            order = self.client.place_order(
+                category="linear",
+                symbol=symbol,
+                side=side,
+                orderType="Market",
+                qty=str(pos['quantity']),
+                timeInForce="GTC",
+                positionIdx=0,
+                reduceOnly=True
+            )
+            
+            if order['retCode'] == 0:
+                self.logger.info(f"✅ Позиция закрыта: {symbol} (причина: {reason})")
+                
+                # Отправляем уведомление
+                await self.telegram.send_position_closed(
+                    symbol=symbol,
+                    reason=reason
+                )
+                
+                # Удаляем из списка
+                del self.open_positions[symbol]
+            else:
+                self.logger.error(f"❌ Ошибка закрытия позиции {symbol}: {order.get('retMsg', 'Unknown')}")
+                
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка при закрытии позиции {symbol}: {e}")
+    
+    async def send_daily_report(self):
+        """Отправка ежедневного отчёта"""
+        if not config.DAILY_REPORT_ENABLED:
+            return
+        
+        try:
+            report = self.daily_reporter.generate_daily_report()
+            await self.telegram.send_message(report)
+            self.logger.info("📊 Ежедневный отчёт отправлен")
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка отправки ежедневного отчёта: {e}")
+    
+    def should_send_daily_report(self) -> bool:
+        """Проверка нужно ли отправлять ежедневный отчёт"""
+        if not config.DAILY_REPORT_ENABLED:
+            return False
+        
+        now = datetime.now(timezone.utc)
+        
+        # Конвертируем время отчёта в UTC (отчёт в 09:00 UTC+1 = 08:00 UTC)
+        report_hour, report_minute = map(int, config.DAILY_REPORT_TIME.split(':'))
+        report_hour_utc = (report_hour - 1) % 24  # UTC+1 -> UTC
+        
+        # Проверяем что сейчас нужное время
+        if now.hour != report_hour_utc or now.minute < report_minute:
+            return False
+        
+        # Проверяем что отчёт ещё не отправлялся сегодня
+        if self.last_daily_report:
+            if self.last_daily_report.date() == now.date():
+                return False
+        
+        return True
+    
+    # ═══════════════════════════════════════════════════════════════════
+    # ВОССТАНОВЛЕНИЕ ПОЗИЦИЙ
+    # ═══════════════════════════════════════════════════════════════════
+    
+    async def restore_positions_from_exchange(self):
+        """Восстанавливает открытые позиции с биржи при старте бота"""
+        self.logger.info("🔄 Восстановление позиций с биржи...")
+        
+        try:
+            # Получаем все открытые позиции
+            response = self.client.get_positions(
+                category="linear",
+                settleCoin="USDT"
+            )
+            
+            if response['retCode'] != 0:
+                self.logger.error(f"❌ Ошибка получения позиций: {response.get('retMsg')}")
+                return
+            
+            positions = response['result']['list']
+            restored_count = 0
+            
+            for pos in positions:
+                size = float(pos.get('size', 0))
+                
+                # Пропускаем закрытые позиции
+                if size == 0:
+                    continue
+                
+                symbol = pos['symbol']
+                side = pos['side']  # Buy или Sell
+                entry_price = float(pos['avgPrice'])
+                
+                # Определяем направление
+                direction = "LONG" if side == "Buy" else "SHORT"
+                
+                # Восстанавливаем позицию в памяти
+                self.open_positions[symbol] = {
+                    'symbol': symbol,
+                    'direction': direction,
+                    'entry_price': entry_price,
+                    'quantity': size,
+                    'initial_quantity': size,
+                    'leverage': int(pos.get('leverage', config.LEVERAGE)),
+                    'open_time': datetime.now(timezone.utc),
+                    'sl_price': float(pos.get('stopLoss', 0)) if pos.get('stopLoss') else None,
+                    'tp_price': float(pos.get('takeProfit', 0)) if pos.get('takeProfit') else None,
+                    'max_profit_percent': 0.0,
+                    'trailing_sl_active': False,
+                    'restored': True,  # Флаг что позиция восстановлена
+                }
+                
+                pnl = float(pos.get('unrealisedPnl', 0))
+                
+                self.logger.info(
+                    f"✅ Восстановлена позиция: {symbol} {direction} | "
+                    f"Размер: {size} | Вход: ${entry_price:.4f} | PnL: ${pnl:.2f}"
+                )
+                
+                # Отправляем уведомление в Telegram
+                await self.telegram.send_message(
+                    f"🔄 <b>ПОЗИЦИЯ ВОССТАНОВЛЕНА</b>\n\n"
+                    f"💎 Монета: <b>{symbol}</b>\n"
+                    f"📊 Направление: {direction}\n"
+                    f"💰 Цена входа: ${entry_price:.6f}\n"
+                    f"📦 Размер: {size}\n"
+                    f"💵 PnL: ${pnl:.2f}\n\n"
+                    f"⚠️ Позиция была открыта до перезапуска бота"
+                )
+                
+                restored_count += 1
+            
+            if restored_count > 0:
+                self.logger.info(f"✅ Восстановлено позиций: {restored_count}")
+            else:
+                self.logger.info("📭 Нет открытых позиций на бирже")
+                
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка восстановления позиций: {e}")
+    
+    # ═══════════════════════════════════════════════════════════════════
+    # ГЛАВНЫЙ ЦИКЛ
+    # ═══════════════════════════════════════════════════════════════════
+    
+    async def run(self):
+        """Главный цикл бота"""
+        self.logger.info("🚀 Бот запущен!")
+        
+        # Запускаем Telegram бота для обработки команд в фоне (в отдельном потоке)
+        self.telegram.start()
+        self.logger.info("📱 Telegram бот запускается...")
+        
+        # Даём время на инициализацию
+        await asyncio.sleep(3)
+        
+        # Восстанавливаем позиции с биржи
+        await self.restore_positions_from_exchange()
+        
+        # Отправляем стартовое сообщение
+        await self.telegram.send_startup_message()
+        self.logger.info("📱 Telegram бот готов принимать команды")
+        
+        last_analysis = 0
+        last_monitoring = 0
+        
+        try:
+            while self.active:
+                try:
+                    current_time = time.time()
+                    
+                    # Анализ рынка каждые 15 минут
+                    if current_time - last_analysis >= config.ANALYSIS_INTERVAL_SECONDS:
+                        await self.scan_and_trade()
+                        last_analysis = current_time
+                        self.cycle_count += 1
+                    
+                    # Мониторинг позиций каждую минуту
+                    if current_time - last_monitoring >= config.MONITORING_INTERVAL_SECONDS:
+                        await self.monitor_positions()
+                        last_monitoring = current_time
+                    
+                    # Проверка ежедневного отчёта
+                    if self.should_send_daily_report():
+                        await self.send_daily_report()
+                        self.last_daily_report = datetime.now(timezone.utc)
+                    
+                    # Небольшая пауза
+                    await asyncio.sleep(10)
+                    
+                except KeyboardInterrupt:
+                    self.logger.info("⏹️ Получен сигнал остановки")
+                    break
+                except Exception as e:
+                    self.logger.error(f"❌ Ошибка в главном цикле: {e}")
+                    await asyncio.sleep(60)
+        finally:
+            # Останавливаем Telegram бота
+            self.telegram.stop()
+            self.logger.info("👋 Бот остановлен")
+
+
+async def main():
+    """Точка входа"""
+    bot = TradingBotV4MTF()
+    await bot.run()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
