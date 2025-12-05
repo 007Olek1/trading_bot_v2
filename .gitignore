@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.env
+.env.local
+*.log
+*.log.*
+data/
+logs/
+tradegpt_v5.log
+*.sqlite
+*.db
+*.db-shm
+*.db-wal
