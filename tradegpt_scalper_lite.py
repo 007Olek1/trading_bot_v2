@@ -92,11 +92,11 @@ PROFIT_LOCK_SL_PCT = 0.005      # фиксируем минимум +0.5%
 
 # Уровень 4: Trailing активируется при +2%
 TRAILING_ACTIVATION_PCT = 0.02  # +2% прибыли для активации trailing
-TRAILING_DISTANCE_PCT = 0.0075  # 0.75% trailing distance
+TRAILING_DISTANCE_PCT = float(os.getenv('TRAILING_DISTANCE_PCT', '0.005'))  # 0.5% trailing distance
 
 # Уровень 5: Жесткий trailing при +3%
 TRAILING_TIGHT_LEVEL_PCT = 0.03  # +3% прибыли
-TRAILING_TIGHT_DISTANCE_PCT = 0.005  # 0.5% trailing distance
+TRAILING_TIGHT_DISTANCE_PCT = float(os.getenv('TRAILING_TIGHT_DISTANCE_PCT', '0.003'))  # 0.3% trailing distance
 
 # Дневной лимит
 DAILY_MAX_LOSS_USD = float(os.getenv('DAILY_MAX_LOSS_USD', 5.0))
@@ -106,6 +106,9 @@ SCAN_INTERVAL_SEC = int(os.getenv('SCAN_INTERVAL_SEC', 60))  # Чаще скан
 POSITION_CHECK_INTERVAL = 10  # Проверяем позиции каждые 10 сек
 BYBIT_FEE_PCT = 0.00075
 SYMBOL_COOLDOWN_SEC = 300  # 5 минут кулдаун после закрытия
+SYMBOL_ENTRY_COOLDOWN_SEC = int(os.getenv('SYMBOL_ENTRY_COOLDOWN_SEC', 1800))
+SECTOR_ENTRY_COOLDOWN_SEC = int(os.getenv('SECTOR_ENTRY_COOLDOWN_SEC', 900))
+MEME_SECTOR_COOLDOWN_SEC = int(os.getenv('MEME_SECTOR_COOLDOWN_SEC', 1800))
 POSITION_CLOSE_CHECK_INTERVAL = 2
 POSITION_CLOSE_MAX_WAIT = 30
 
@@ -113,7 +116,9 @@ POSITION_CLOSE_MAX_WAIT = 30
 MIN_VOLUME_24H_USD = 10_000_000
 MAX_SPREAD_PCT = 0.001
 MIN_SIGNAL_STRENGTH = 3
+MEME_MIN_SIGNAL_STRENGTH = int(os.getenv('MEME_MIN_SIGNAL_STRENGTH', MIN_SIGNAL_STRENGTH + 1))
 DISCO57_MIN_CONFIDENCE = 0.7
+MEME_MIN_DISCO_CONFIDENCE = float(os.getenv('MEME_MIN_DISCO_CONFIDENCE', 0.8))
 MIN_ATR_PCT = 0.004  # Минимальная волатильность 0.4%
 MIN_RANGE_PCT = 0.006  # Диапазон движения за последние свечи минимум 0.6%
 
@@ -230,6 +235,8 @@ class TradeGPTScalperLite:
         self.daily_trades = 0
         self.last_reset_date = datetime.now().date()
         self.symbol_cooldowns: Dict[str, float] = {}
+        self.symbol_last_entry: Dict[str, float] = {}
+        self.sector_last_entry: Dict[str, float] = {}
         self.loss_streak = 0
         
         # Кэш признаков для обучения
@@ -362,6 +369,7 @@ class TradeGPTScalperLite:
                         original_quantity=size,
                         sl_pct=sl_pct_value
                     )
+                    self._record_entry_timestamp(symbol)
                     
                     sl_info = f"${sl_price:.6f}" if sl_price > 0 else "НЕТ"
                     logger.info(f"Загружена позиция: {symbol} {side.upper()} @ {entry_price} | SL: {sl_info}")
@@ -395,13 +403,39 @@ class TradeGPTScalperLite:
     
     async def scan_for_entries(self):
         """Сканирование монет для поиска входов"""
+        if len(self.positions) >= MAX_POSITIONS:
+            return False
+        
         logger.info(f"Сканирование {len(TRADING_SYMBOLS)} монет...")
         current_time = time.time()
+        candidates: List[Dict] = []
         
         for symbol in TRADING_SYMBOLS:
             if symbol in self.positions:
                 continue
-            
+            now = time.time()
+            normalized = self._normalize_symbol(symbol)
+            last_entry_ts = self.symbol_last_entry.get(normalized)
+            if last_entry_ts and now - last_entry_ts < SYMBOL_ENTRY_COOLDOWN_SEC:
+                logger.debug(
+                    f"{symbol}: на кулдауне после предыдущего входа ещё {int(SYMBOL_ENTRY_COOLDOWN_SEC - (now - last_entry_ts))}с"
+                )
+                continue
+
+            sector = self._get_sector(symbol)
+            if sector:
+                sector_cooldown = MEME_SECTOR_COOLDOWN_SEC if sector == 'MEME' else SECTOR_ENTRY_COOLDOWN_SEC
+                last_sector_ts = self.sector_last_entry.get(sector)
+                if last_sector_ts and now - last_sector_ts < sector_cooldown:
+                    logger.debug(
+                        f"{symbol}: сектор {sector} на кулдауне ещё {int(sector_cooldown - (now - last_sector_ts))}с"
+                    )
+                    continue
+                max_sector_positions = MAX_SECTOR_POSITIONS.get(sector, 1)
+                if self._sector_position_count(sector) >= max_sector_positions:
+                    logger.debug(f"{symbol}: сектор {sector} уже занят ({max_sector_positions})")
+                    continue
+
             if symbol in self.symbol_cooldowns and current_time < self.symbol_cooldowns[symbol]:
                 continue
             
@@ -412,28 +446,70 @@ class TradeGPTScalperLite:
                 if not candles or len(candles) < 10:
                     continue
                 
-                sector = self._get_sector(symbol)
-                if sector and self._sector_position_count(sector) >= MAX_SECTOR_POSITIONS.get(sector, 1):
-                    logger.debug(f"{symbol}: сектор {sector} уже занят, пропускаем")
-                    continue
-                
                 signal = await self.analyze_entry(symbol, ticker, candles)
                 
                 if signal:
-                    await self.open_position(signal)
-                    await asyncio.sleep(2)
-                    
-                    if len(self.positions) >= MAX_POSITIONS:
-                        break
+                    signal['scan_timestamp'] = now
+                    signal['sector'] = sector
+                    candidates.append(signal)
                         
             except Exception as e:
                 logger.debug(f"Ошибка анализа {symbol}: {e}")
                 continue
+        
+        if not candidates:
+            return False
+        
+        available_slots = MAX_POSITIONS - len(self.positions)
+        if available_slots <= 0:
+            return False
+        
+        candidates.sort(
+            key=lambda s: (
+                s.get('signal_strength', 0),
+                s.get('disco_confidence', 0.0)
+            ),
+            reverse=True
+        )
+        
+        opened = False
+        for signal in candidates:
+            if available_slots <= 0:
+                break
+            
+            symbol = signal['symbol']
+            if symbol in self.positions:
+                continue
+            
+            now = time.time()
+            normalized = self._normalize_symbol(symbol)
+            last_entry_ts = self.symbol_last_entry.get(normalized)
+            if last_entry_ts and now - last_entry_ts < SYMBOL_ENTRY_COOLDOWN_SEC:
+                continue
+            
+            sector = signal.get('sector') or self._get_sector(symbol)
+            if sector:
+                sector_cooldown = MEME_SECTOR_COOLDOWN_SEC if sector == 'MEME' else SECTOR_ENTRY_COOLDOWN_SEC
+                last_sector_ts = self.sector_last_entry.get(sector)
+                if last_sector_ts and now - last_sector_ts < sector_cooldown:
+                    continue
+                max_sector_positions = MAX_SECTOR_POSITIONS.get(sector, 1)
+                if self._sector_position_count(sector) >= max_sector_positions:
+                    continue
+            
+            await self.open_position(signal)
+            available_slots -= 1
+            opened = True
+            await asyncio.sleep(2)
+        
+        return opened
     
     async def analyze_entry(self, symbol: str, ticker: Dict, candles: List) -> Optional[Dict]:
         """Анализ возможности входа с ЖЕСТКИМИ ФИЛЬТРАМИ"""
         try:
             price = float(ticker['last'])
+            sector = self._get_sector(symbol)
+            is_meme = sector == 'MEME'
             
             # ========== ПРОВЕРКА СПРЕДА ==========
             if 'bid' in ticker and 'ask' in ticker:
@@ -522,6 +598,12 @@ class TradeGPTScalperLite:
             # Нет сигнала или слабый сигнал
             if not direction:
                 return None
+
+            if is_meme and signal_strength < MEME_MIN_SIGNAL_STRENGTH:
+                logger.debug(
+                    f"{symbol}: MEME сигнал ({signal_strength}) < требуемых {MEME_MIN_SIGNAL_STRENGTH}"
+                )
+                return None
             
             # ========== РАСЧЕТ TP/SL ==========
             sl_pct = SL_PERCENT_STRONG if signal_strength >= MIN_SIGNAL_STRENGTH + 1 else SL_PERCENT_MEDIUM
@@ -568,6 +650,11 @@ class TradeGPTScalperLite:
                     if disco_confidence < DISCO57_MIN_CONFIDENCE:
                         logger.debug(
                             f"{symbol}: Disco57 confidence {disco_confidence:.2f} < {DISCO57_MIN_CONFIDENCE:.2f}, пропускаем"
+                        )
+                        return None
+                    if is_meme and disco_confidence < MEME_MIN_DISCO_CONFIDENCE:
+                        logger.debug(
+                            f"{symbol}: MEME требует Disco57 >= {MEME_MIN_DISCO_CONFIDENCE:.2f} (получено {disco_confidence:.2f})"
                         )
                         return None
                     
@@ -679,8 +766,22 @@ class TradeGPTScalperLite:
         
         return tp_price, sl_price
     
+    def _normalize_symbol(self, symbol: str) -> str:
+        base = symbol.split('/')[0]
+        base = base.replace(':USDT', '').replace('USDT', '')
+        return base.upper()
+
+    def _record_entry_timestamp(self, symbol: str, timestamp: Optional[float] = None):
+        if timestamp is None:
+            timestamp = time.time()
+        normalized = self._normalize_symbol(symbol)
+        self.symbol_last_entry[normalized] = timestamp
+        sector = self._get_sector(symbol)
+        if sector:
+            self.sector_last_entry[sector] = timestamp
+
     def _get_sector(self, symbol: str) -> Optional[str]:
-        base = symbol.split('/')[0].replace(':USDT', '')
+        base = self._normalize_symbol(symbol)
         return SYMBOL_SECTOR_MAP.get(base)
     
     def _sector_position_count(self, sector: str) -> int:
@@ -761,6 +862,7 @@ class TradeGPTScalperLite:
             
             self.positions[symbol] = pos
             self.daily_trades += 1
+            self._record_entry_timestamp(symbol)
             
             # Записать в базу данных
             if self.trade_db:

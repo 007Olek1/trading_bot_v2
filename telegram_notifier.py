@@ -138,8 +138,8 @@ class TelegramNotifier:
             f"📊 <b>Уровни защиты:</b>\n"
             f"   +0.75% → SL -0.75%\n"
             f"   +1.5% → SL +0.5% + TP 30%\n"
-            f"   +2.0% → Trailing 0.75%\n"
-            f"   +3.0% → Tight 0.5%\n\n"
+            f"   +2.0% → Trailing 0.50%\n"
+            f"   +3.0% → Tight 0.30%\n\n"
         )
         
         if signal_strength > 0 or disco_confidence > 0:
