@@ -61,9 +61,15 @@ class TradeHistoryDB:
                     quantity REAL NOT NULL,
                     pnl_usd REAL,
                     pnl_pct REAL,
+                    pnl_r REAL,
                     reason TEXT,
                     signal_strength INTEGER,
                     disco_confidence REAL,
+                    disco_decision TEXT,
+                    risk_usd REAL,
+                    sl_distance REAL,
+                    sl_price REAL,
+                    tp_price REAL,
                     trailing_activated INTEGER DEFAULT 0,
                     duration_sec REAL,
                     status TEXT DEFAULT 'open',
@@ -86,6 +92,20 @@ class TradeHistoryDB:
                     avg_duration_sec REAL DEFAULT 0
                 )
             ''')
+            # Таблица частичных фиксаций
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS trade_partials (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trade_id INTEGER NOT NULL,
+                    timestamp REAL NOT NULL,
+                    exit_price REAL NOT NULL,
+                    quantity REAL NOT NULL,
+                    pnl_usd REAL NOT NULL,
+                    pnl_pct REAL NOT NULL,
+                    reason TEXT,
+                    FOREIGN KEY(trade_id) REFERENCES trades(id) ON DELETE CASCADE
+                )
+            ''')
             # Индексы для быстрого поиска
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol)')
@@ -103,6 +123,33 @@ class TradeHistoryDB:
             if 'closed_at' not in columns:
                 cursor.execute('ALTER TABLE trades ADD COLUMN closed_at REAL')
                 logger.info("Добавлена колонка closed_at в таблицу trades")
+            if 'risk_usd' not in columns:
+                cursor.execute('ALTER TABLE trades ADD COLUMN risk_usd REAL')
+                logger.info("Добавлена колонка risk_usd в таблицу trades")
+            if 'sl_distance' not in columns:
+                cursor.execute('ALTER TABLE trades ADD COLUMN sl_distance REAL')
+                logger.info("Добавлена колонка sl_distance в таблицу trades")
+            if 'pnl_r' not in columns:
+                cursor.execute('ALTER TABLE trades ADD COLUMN pnl_r REAL')
+                logger.info("Добавлена колонка pnl_r в таблицу trades")
+            if 'disco_confidence' not in columns:
+                cursor.execute('ALTER TABLE trades ADD COLUMN disco_confidence REAL')
+                logger.info("Добавлена колонка disco_confidence в таблицу trades")
+            if 'disco_decision' not in columns:
+                cursor.execute('ALTER TABLE trades ADD COLUMN disco_decision TEXT')
+                logger.info("Добавлена колонка disco_decision в таблицу trades")
+            if 'sl_price' not in columns:
+                cursor.execute('ALTER TABLE trades ADD COLUMN sl_price REAL')
+                logger.info("Добавлена колонка sl_price в таблицу trades")
+            if 'tp_price' not in columns:
+                cursor.execute('ALTER TABLE trades ADD COLUMN tp_price REAL')
+                logger.info("Добавлена колонка tp_price в таблицу trades")
+
+            cursor.execute('PRAGMA table_info(trade_partials)')
+            partial_columns = {row[1] for row in cursor.fetchall()}
+            if 'quantity' not in partial_columns:
+                cursor.execute('ALTER TABLE trade_partials ADD COLUMN quantity REAL DEFAULT 0')
+                logger.info("Добавлена колонка quantity в таблицу trade_partials")
 
             conn.commit()
 
@@ -118,57 +165,133 @@ class TradeHistoryDB:
         if deleted > 0:
             logger.info(f"Удалено {deleted} старых записей (старше {RETENTION_HOURS}ч)")
     
-    def add_trade_open(self, symbol: str, side: str, entry_price: float, 
-                       quantity: float, signal_strength: int = 0, 
-                       disco_confidence: float = 0) -> int:
+    def add_trade_open(
+        self,
+        symbol: str,
+        side: str,
+        entry_price: float,
+        quantity: float,
+        risk_usd: float,
+        sl_distance: float,
+        sl_price: float,
+        tp_price: float,
+        signal_strength: int = 0,
+        disco_confidence: float = 0,
+    ) -> int:
         """Добавить открытую сделку"""
         conn = self._get_connection()
         with self._lock:
             cursor = conn.cursor()
             cursor.execute('''
-                INSERT INTO trades (timestamp, symbol, side, entry_price, quantity, 
-                                   signal_strength, disco_confidence, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 'open')
-            ''', (time.time(), symbol, side, entry_price, quantity, 
-                  signal_strength, disco_confidence))
+                INSERT INTO trades (
+                    timestamp, symbol, side, entry_price, quantity,
+                    risk_usd, sl_distance, sl_price, tp_price,
+                    signal_strength, disco_confidence, disco_decision, status
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')
+            ''', (
+                time.time(),
+                symbol,
+                side,
+                entry_price,
+                quantity,
+                risk_usd,
+                sl_distance,
+                sl_price,
+                tp_price,
+                signal_strength,
+                disco_confidence,
+                None,
+            ))
             trade_id = cursor.lastrowid
             conn.commit()
         logger.debug(f"Сделка открыта в БД: {symbol} {side} #{trade_id}")
         return trade_id
     
-    def close_trade(self, symbol: str, exit_price: float, pnl_usd: float, 
-                    reason: str, trailing_activated: bool = False):
-        """Закрыть сделку"""
+    def update_trade_levels(
+        self,
+        symbol: str,
+        sl_price: Optional[float] = None,
+        tp_price: Optional[float] = None,
+    ) -> None:
+        if sl_price is None and tp_price is None:
+            return
+        conn = self._get_connection()
+        with self._lock:
+            cursor = conn.cursor()
+            fields = []
+            params: List[float] = []
+            if sl_price is not None:
+                fields.append("sl_price = ?")
+                params.append(sl_price)
+            if tp_price is not None:
+                fields.append("tp_price = ?")
+                params.append(tp_price)
+            params.append(symbol)
+            cursor.execute(
+                f"UPDATE trades SET {', '.join(fields)} WHERE symbol = ? AND status = 'open'",
+                params,
+            )
+            conn.commit()
+        logger.debug("Обновлены уровни %s (SL=%s TP=%s)", symbol, sl_price, tp_price)
+    
+    def _get_open_trade_row(self, symbol: str):
         conn = self._get_connection()
         with self._lock:
             cursor = conn.cursor()
             cursor.execute('''
-                SELECT id, timestamp, entry_price FROM trades 
+                SELECT id, timestamp
+                FROM trades 
                 WHERE symbol = ? AND status = 'open' 
                 ORDER BY timestamp DESC LIMIT 1
             ''', (symbol,))
-            row = cursor.fetchone()
+            return cursor.fetchone()
+
+    def close_trade(
+        self,
+        symbol: str,
+        exit_price: float,
+        pnl_usd: float,
+        pnl_pct: float,
+        pnl_r: float,
+        reason: str,
+        trailing_activated: bool = False,
+    ):
+        """Закрыть сделку"""
+        conn = self._get_connection()
+        with self._lock:
+            cursor = conn.cursor()
+            row = self._get_open_trade_row(symbol)
             if not row:
                 logger.warning(f"Открытая сделка не найдена: {symbol}")
                 return
 
-            trade_id, open_time, entry_price = row
+            trade_id, open_time = row
             duration = time.time() - open_time
-            pnl_pct = (exit_price - entry_price) / entry_price * 100 if entry_price > 0 else 0
 
             cursor.execute('''
                 UPDATE trades SET 
                     exit_price = ?,
                     pnl_usd = ?,
                     pnl_pct = ?,
+                    pnl_r = ?,
                     reason = ?,
                     trailing_activated = ?,
                     duration_sec = ?,
                     status = 'closed',
                     closed_at = ?
                 WHERE id = ?
-            ''', (exit_price, pnl_usd, pnl_pct, reason, 
-                  1 if trailing_activated else 0, duration, time.time(), trade_id))
+            ''', (
+                exit_price,
+                pnl_usd,
+                pnl_pct,
+                pnl_r,
+                reason,
+                1 if trailing_activated else 0,
+                duration,
+                time.time(),
+                trade_id,
+            ))
             conn.commit()
 
         # Обновить дневную статистику (отдельно, чтобы избежать долгой блокировки)
@@ -200,6 +323,24 @@ class TradeHistoryDB:
                   1 if pnl_usd <= 0 else 0,
                   pnl_usd, pnl_usd, pnl_usd, duration))
             self._conn.commit()
+    
+    def add_trade_partial(
+        self,
+        trade_id: int,
+        exit_price: float,
+        quantity: float,
+        pnl_usd: float,
+        pnl_pct: float,
+        reason: str,
+    ) -> None:
+        conn = self._get_connection()
+        with self._lock:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO trade_partials (trade_id, timestamp, exit_price, quantity, pnl_usd, pnl_pct, reason)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (trade_id, time.time(), exit_price, quantity, pnl_usd, pnl_pct, reason))
+            conn.commit()
     
     def get_recent_trades(self, hours: int = 24, limit: int = 50) -> List[Dict]:
         """Получить последние сделки"""

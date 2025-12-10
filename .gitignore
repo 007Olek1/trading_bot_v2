@@ -11,3 +11,10 @@ tradegpt_v5.log
 *.db
 *.db-shm
 *.db-wal
+.venv/
+bot.out
+log.txt
+tmp/
+data/
+scripts/__pycache__/
+src/__pycache__/
